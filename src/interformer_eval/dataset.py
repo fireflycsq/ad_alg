@@ -1,4 +1,26 @@
-"""Dataset processing for InterFormer — synthetic data + Parquet streaming."""
+"""InterFormer eval dataset — reads raw multi-column Parquet for inference.
+
+Uses the same ``schema.json`` format as training data:
+{
+  "user_int": [[fid, vocab_size, dim], ...],
+  "item_int": [],
+  "user_dense": [[fid, dim], ...],
+  "item_dense": [],
+  "seq": {
+    "domain_a": {
+      "prefix": "seq_domain_a",
+      "ts_fid": 100,
+      "features": [[100, vocab_size], ...]
+    }
+  }
+}
+
+Column naming convention:
+  - user_dense_feats_{fid}   (list<float>)
+  - user_int_feats_{fid}     (int or list<int>)
+  - {seq_prefix}_{fid}       (list<int64>)
+  - user_id, timestamp, label_type
+"""
 
 import os
 import json
@@ -11,79 +33,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 import torch.multiprocessing
-from torch.utils.data import Dataset, DataLoader, IterableDataset
+from torch.utils.data import IterableDataset, DataLoader
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 
-class CTRDataset(Dataset):
-    """CTR dataset for InterFormer."""
-    
-    def __init__(self, dense, sparse_ids, seq_ids, labels, seq_padding_mask=None):
-        """
-        Args:
-            dense: (N, dense_dim) tensor of dense features
-            sparse_ids: (N, n_sparse) tensor of sparse feature indices
-            seq_ids: (N, T) or (N, k, T) tensor of sequence ids
-            labels: (N,) tensor of labels
-            seq_padding_mask: (N, T) tensor of padding masks, optional
-        """
-        self.dense = dense
-        self.sparse_ids = sparse_ids
-        self.seq_ids = seq_ids
-        self.labels = labels
-        self.seq_padding_mask = seq_padding_mask
-    
-    def __len__(self):
-        return len(self.labels)
-    
-    def __getitem__(self, idx):
-        if self.seq_padding_mask is not None:
-            return (
-                self.dense[idx],
-                self.sparse_ids[idx],
-                self.seq_ids[idx],
-                self.seq_padding_mask[idx],
-                self.labels[idx]
-            )
-        else:
-            return (
-                self.dense[idx],
-                self.sparse_ids[idx],
-                self.seq_ids[idx],
-                self.labels[idx]
-            )
-
-
-def make_synthetic_batch(B: int, dense_dim: int, n_sparse: int,
-                         vocab_size: int, seq_len: int, device: str = "cpu"):
-    """Generate a random batch for quick testing."""
-    dense = torch.randn(B, dense_dim, device=device)
-    sparse_cols = [torch.randint(0, vs, (B,), device=device) for vs in [100, 200, 150, 300][:n_sparse]]
-    sparse_ids = torch.stack(sparse_cols, dim=1)
-    seq_ids = torch.randint(1, min(sparse_vocab_sizes := [100, 200, 150, 300][:n_sparse]) if n_sparse else vocab_size, (B, seq_len), device=device)
-    # Random padding mask: last 20% of sequence is padding
-    pad_start = int(seq_len * 0.8)
-    seq_padding_mask = torch.zeros(B, seq_len, dtype=torch.bool, device=device)
-    seq_padding_mask[:, pad_start:] = True
-    labels = torch.randint(0, 2, (B,), device=device)
-    return dense, sparse_ids, seq_ids, seq_padding_mask, labels
-
-
-def create_dataloaders(train_data, val_data, batch_size=64):
-    """Create dataloaders for training and validation."""
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False)
-    return train_loader, val_loader
-
-
-# ---------------------------------------------------------------------------
-# Parquet dataset (PCVRHyFormer schema format)
-# ---------------------------------------------------------------------------
-
 class InterFormerParquetDataset(IterableDataset):
-    """IterableDataset reading raw multi-column Parquet for InterFormer training.
+    """IterableDataset reading raw multi-column Parquet for InterFormer.
 
     Parses the full PCVRHyFormer schema, extracting the fields InterFormer
     requires: dense features (user_dense), sparse IDs (user_int), one
@@ -91,6 +48,9 @@ class InterFormerParquetDataset(IterableDataset):
 
     Exposes ``dense_dim`` and ``sparse_vocabs`` so the training script can
     construct the model with the correct input dimensions.
+
+    When ``is_training=False``, labels are not extracted and ``user_id`` is
+    included in each batch dict for inference.
     """
 
     def __init__(
@@ -183,7 +143,7 @@ class InterFormerParquetDataset(IterableDataset):
         logging.info(
             f"InterFormerParquetDataset: {self.num_rows} rows, "
             f"dense_dim={self.dense_dim}, n_sparse={len(self.sparse_vocabs)}, "
-            f"seq_len={seq_len}, shuffle={shuffle}")
+            f"seq_len={seq_len}, is_training={is_training}")
 
     def _load_schema(self, schema_path: str) -> None:
         with open(schema_path, 'r', encoding='utf-8') as f:
@@ -357,61 +317,23 @@ class InterFormerParquetDataset(IterableDataset):
         return result
 
 
-def get_interformer_data(
+def get_interformer_eval_data(
     data_dir: str,
     schema_path: str,
     batch_size: int = 256,
-    train_ratio: float = 0.8,
     num_workers: int = 0,
-    buffer_batches: int = 20,
-    seed: int = 42,
     seq_len: int = 100,
     seq_domain: str = 'domain_a',
-    max_dense_per_feat: int = 32,
     seq_vocab_size: int = 100000,
-) -> Tuple[DataLoader, DataLoader, InterFormerParquetDataset]:
-    """Create train / valid DataLoaders using Row Group split.
-
-    The validation split is taken as the last ``(1 - train_ratio)`` fraction
-    of Row Groups.
+    max_dense_per_feat: int = 32,
+) -> Tuple[DataLoader, InterFormerParquetDataset]:
+    """Create a DataLoader and dataset for InterFormer inference.
 
     Returns:
-        (train_loader, valid_loader, train_dataset) — dataset exposes
-        ``dense_dim`` and ``sparse_vocabs`` for model construction.
+        (loader, dataset) — dataset exposes ``dense_dim`` and
+        ``sparse_vocabs`` for model construction.
     """
-    random.seed(seed)
-    import glob as _glob
-
-    pq_files = sorted(_glob.glob(os.path.join(data_dir, '*.parquet')))
-    rg_info = []
-    for f in pq_files:
-        pf = pq.ParquetFile(f)
-        for i in range(pf.metadata.num_row_groups):
-            rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
-    total_rgs = len(rg_info)
-
-    n_train_rgs = max(1, int(total_rgs * train_ratio))
-    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-    valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
-
-    logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
-                 f"{total_rgs - n_train_rgs} valid ({valid_rows} rows)")
-
-    train_dataset = InterFormerParquetDataset(
-        parquet_path=data_dir,
-        schema_path=schema_path,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        seq_domain=seq_domain,
-        seq_vocab_size=seq_vocab_size,
-        max_dense_per_feat=max_dense_per_feat,
-        shuffle=True,
-        buffer_batches=buffer_batches,
-        row_group_range=(0, n_train_rgs),
-        is_training=True,
-    )
-
-    valid_dataset = InterFormerParquetDataset(
+    dataset = InterFormerParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
         batch_size=batch_size,
@@ -421,24 +343,18 @@ def get_interformer_data(
         max_dense_per_feat=max_dense_per_feat,
         shuffle=False,
         buffer_batches=0,
-        row_group_range=(n_train_rgs, total_rgs),
-        is_training=True,
+        is_training=False,
     )
 
-    use_cuda = torch.cuda.is_available()
-    train_kwargs = {}
+    loader_kwargs = {}
     if num_workers > 0:
-        train_kwargs['prefetch_factor'] = 2
-    train_loader = DataLoader(
-        train_dataset, batch_size=None,
-        num_workers=num_workers, pin_memory=use_cuda, **train_kwargs,
-    )
-    valid_loader = DataLoader(
-        valid_dataset, batch_size=None,
-        num_workers=0, pin_memory=use_cuda,
-    )
+        loader_kwargs['prefetch_factor'] = 2
 
-    logging.info(f"InterFormer Parquet train: {train_rows} rows, "
-                 f"valid: {valid_rows} rows, batch_size={batch_size}")
-
-    return train_loader, valid_loader, train_dataset
+    loader = DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        **loader_kwargs,
+    )
+    return loader, dataset

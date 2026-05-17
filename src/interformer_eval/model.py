@@ -1,7 +1,6 @@
 """
 InterFormer: Effective Heterogeneous Interaction Learning for CTR Prediction
 Paper: https://arxiv.org/abs/2411.09852
-Corrected PyTorch implementation following the paper's architecture precisely.
 
 Architecture Overview:
   For each layer l = 1..L:
@@ -49,7 +48,7 @@ class MLP(nn.Module):
 class Gating(nn.Module):
     """
     Self-gating mechanism (Eq. 10).
-    Gating(X) = σ(X ⊙ MLP(X))
+    Gating(X) = sigmoid(X * MLP(X))
 
     Provides sparse masking: relevant information retained, noise filtered out.
     """
@@ -80,23 +79,15 @@ class RotaryPositionEmbedding(nn.Module):
         super().__init__()
         self.head_dim = head_dim
         self.max_len = max_len
-        # Precompute frequency bands
         freqs = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
         positions = torch.arange(max_len).float()
-        angles = torch.outer(positions, freqs)  # (max_len, head_dim/2)
+        angles = torch.outer(positions, freqs)
         self.register_buffer("cos", angles.cos(), persistent=False)
         self.register_buffer("sin", angles.sin(), persistent=False)
 
     def forward(self, q: Tensor, k: Tensor, seq_offset: int = 0) -> tuple:
-        """
-        Args:
-            q: (B, n_heads, T, head_dim)
-            k: (B, n_heads, T, head_dim)
-            seq_offset: position offset for the first token
-        Returns rotated (q, k).
-        """
         T = q.size(2)
-        cos = self.cos[seq_offset:seq_offset + T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim/2)
+        cos = self.cos[seq_offset:seq_offset + T].unsqueeze(0).unsqueeze(0)
         sin = self.sin[seq_offset:seq_offset + T].unsqueeze(0).unsqueeze(0)
         return self._apply_rope(q, k, cos, sin)
 
@@ -134,22 +125,15 @@ class RoPEMultiheadAttention(nn.Module):
         self.dropout = dropout
 
     def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
-        """
-        x: (B, T, d) input sequence
-        key_padding_mask: (B, T) True = ignore
-        """
         B, T, d = x.shape
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Apply RoPE to Q and K
         q, k = self.rope(q, k)
 
-        # Prepare attention mask from padding mask
         attn_mask = None
         if key_padding_mask is not None:
-            # Create additive mask: 0 for valid, -inf for padding
             attn_mask = torch.zeros(B, 1, 1, key_padding_mask.size(1),
                                     device=x.device, dtype=x.dtype)
             attn_mask = attn_mask.masked_fill(
@@ -170,14 +154,6 @@ class RoPEMultiheadAttention(nn.Module):
 class FeatureEmbedding(nn.Module):
     """
     Embeds dense + sparse non-sequence features into a unified matrix X^(1).
-
-    Args:
-        dense_dim          : raw dimension of concatenated dense features
-        sparse_vocab_sizes : list of vocabulary sizes for each sparse feature
-        embed_dim          : output embedding dimension d
-
-    Output: X in R^{(1 + n_sparse) x d}
-            first token = dense projection, rest = sparse embeddings
     """
     def __init__(self, dense_dim: int, sparse_vocab_sizes: List[int], embed_dim: int):
         super().__init__()
@@ -199,11 +175,7 @@ class FeatureEmbedding(nn.Module):
 class MaskNet(nn.Module):
     """
     Unifies k sequences and filters noise (Eq. 6).
-    MaskNet(S) = MLP_lce(S ⊙ MLP_mask(S))
-
-    Args:
-        k         : number of sequences
-        embed_dim : d
+    MaskNet(S) = MLP_lce(S * MLP_mask(S))
     """
     def __init__(self, k: int, embed_dim: int, dropout: float = 0.1):
         super().__init__()
@@ -215,10 +187,10 @@ class MaskNet(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, sequences: List[Tensor]) -> Tensor:
-        S = torch.cat(sequences, dim=-1)   # (B, T, k*d)
-        mask = self.mlp_mask(S)            # (B, T, k*d)
+        S = torch.cat(sequences, dim=-1)
+        mask = self.mlp_mask(S)
         S = S * mask
-        S = self.mlp_lce(S)               # (B, T, d)
+        S = self.mlp_lce(S)
         return self.dropout(S)
 
 
@@ -311,9 +283,6 @@ class PMA(nn.Module):
     """
     Pooling by Multi-Head Attention (Eq. 4).
     PMA(Q_pma, S) = MHA(Q_pma, K, V)
-
-    Compresses a sequence of T tokens into k summary tokens using
-    k learnable seed vectors as queries.
     """
     def __init__(self, embed_dim: int, n_heads: int = 4, k_seeds: int = 1):
         super().__init__()
@@ -377,14 +346,9 @@ class PFFN(nn.Module):
         self.embed_dim = embed_dim
 
     def forward(self, X_sum: Tensor, S: Tensor) -> Tensor:
-        """
-        X_sum: (B, n_sum_tokens, d) — non-sequence summarization
-        S:     (B, T, d)            — sequence embeddings (includes CLS tokens)
-        returns (B, T, d)
-        """
-        B = S.size(0)
+        B, T, d = S.shape
         ctx = X_sum.reshape(B, -1)
-        W_pffn = self.hyper(ctx).reshape(B, S.size(-1), S.size(-1))
+        W_pffn = self.hyper(ctx).reshape(B, d, d)
         return self.norm(torch.bmm(S, W_pffn.transpose(1, 2)))
 
 
@@ -396,9 +360,6 @@ class InteractionArch(nn.Module):
     """
     Interaction Arch (Section 4.2 / Eq. 7).
     X^(l+1) = MLP^(l)(Interaction^(l)([X^(l) || S_sum^(l)]))
-
-    Concatenates non-sequence features with sequence summary, runs them
-    through a feature interaction module, then projects back to original shape.
     """
     def __init__(self, n_nonseq_tokens: int, n_sum_tokens: int,
                  embed_dim: int, interaction: str = "dcnv2", dropout: float = 0.1):
@@ -421,14 +382,9 @@ class InteractionArch(nn.Module):
         self.embed_dim = embed_dim
 
     def forward(self, X: Tensor, S_sum: Tensor) -> Tensor:
-        """
-        X     : (B, n_nonseq, d)
-        S_sum : (B, n_sum, d)    sequence summarization from Cross Arch
-        returns (B, n_nonseq, d)
-        """
         B = X.size(0)
-        X_cat = torch.cat([X, S_sum], dim=1)           # (B, n_nonseq+n_sum, d)
-        X_inter = self.interaction(X_cat)               # (B, n_nonseq+n_sum, d)
+        X_cat = torch.cat([X, S_sum], dim=1)
+        X_inter = self.interaction(X_cat)
         flat = X_inter.reshape(B, -1)
         out = self.out_proj(flat).reshape(B, self.n_nonseq, self.embed_dim)
         return self.norm(out)
@@ -440,8 +396,6 @@ class SequenceArch(nn.Module):
     S^(l+1) = MHA^(l)(PFFN(X_sum^(l), S^(l)))
 
     S includes CLS tokens prepended before the first layer.
-    PFFN provides personalized token-wise transform guided by X_sum.
-    MHA applies self-attention with RoPE on the augmented sequence.
     """
     def __init__(self, embed_dim: int, n_heads: int = 4,
                  n_sum_tokens: int = 1, dropout: float = 0.1,
@@ -453,13 +407,8 @@ class SequenceArch(nn.Module):
 
     def forward(self, S: Tensor, X_sum: Tensor,
                 seq_padding_mask: Optional[Tensor] = None) -> Tensor:
-        """
-        S     : (B, n_sum + T, d)  sequence with CLS tokens prepended
-        X_sum : (B, n_sum, d)      non-sequence summarization from Cross Arch
-        seq_padding_mask: (B, T)   True = padding (for sequence portion only)
-        returns (B, n_sum + T, d)
-        """
         B = S.size(0)
+
         if seq_padding_mask is not None:
             cls_mask = seq_padding_mask.new_zeros(B, self.n_sum_tokens)
             full_mask = torch.cat([cls_mask, seq_padding_mask], dim=1)
@@ -477,19 +426,9 @@ class CrossArch(nn.Module):
 
     Non-sequence summarization (Eq. 10):
       X_sum^(l) = Gating(LCE(X^(l)))
-      where Gating(X) = σ(X ⊙ MLP(X))
 
     Sequence summarization (Eq. 11):
       S_sum^(l) = Gating([S_CLS^(l) || S_PMA^(l) || S_recent^(l)])
-
-    Args:
-        embed_dim       : d
-        n_nonseq_tokens : number of non-sequence tokens
-        n_cls_tokens    : CLS tokens (also used as n_sum for X_sum)
-        n_pma_tokens    : number of PMA seeds for sequence summary
-        n_recent_tokens : number of recent tokens to include
-        n_heads         : PMA attention heads
-        dropout         : dropout rate
     """
     def __init__(self, embed_dim: int, n_nonseq_tokens: int,
                  n_cls_tokens: int = 4, n_pma_tokens: int = 2,
@@ -500,44 +439,25 @@ class CrossArch(nn.Module):
         self.n_pma = n_pma_tokens
         self.n_recent = n_recent_tokens
 
-        # Non-sequence summarization: LCE + Gating (Eq. 10)
         self.nonseq_lce = LCE(n_nonseq_tokens, n_cls_tokens, embed_dim)
         self.nonseq_gate = Gating(embed_dim)
-
-        # Sequence PMA summarization (part of Eq. 11)
         self.seq_pma = PMA(embed_dim, n_heads, n_pma_tokens)
-
-        # Sequence gating (Eq. 11) — combines CLS + PMA + recent
         self.seq_gate = Gating(embed_dim)
 
     def forward(self, X: Tensor, S: Tensor):
-        """
-        X: (B, n_nonseq, d)       non-sequence features
-        S: (B, n_cls + T, d)      sequence with CLS tokens prepended
+        # Non-sequence summarization (Eq. 10)
+        X_t = X.transpose(1, 2)
+        X_compressed = self.nonseq_lce(X_t)
+        X_sum = X_compressed.transpose(1, 2)
+        X_sum = self.nonseq_gate(X_sum)
 
-        returns:
-          S_sum: (B, n_cls+n_pma+n_recent, d)  sequence summary for Interaction Arch
-          X_sum: (B, n_cls, d)        non-seq summary for Sequence Arch
-        """
-        # ---- Non-sequence summarization (Eq. 10) ----
-        X_t = X.transpose(1, 2)                      # (B, d, n_nonseq)
-        X_compressed = self.nonseq_lce(X_t)           # (B, d, n_cls)
-        X_sum = X_compressed.transpose(1, 2)          # (B, n_cls, d)
-        X_sum = self.nonseq_gate(X_sum)               # self-gating
+        # Sequence summarization (Eq. 11)
+        S_cls = S[:, :self.n_cls, :]
+        S_pma = self.seq_pma(S)
+        S_recent = S[:, -self.n_recent:, :]
 
-        # ---- Sequence summarization (Eq. 11) ----
-        # CLS tokens: first n_cls tokens of S
-        S_cls = S[:, :self.n_cls, :]                  # (B, n_cls, d)
-
-        # PMA tokens: learnable query-based summarization
-        S_pma = self.seq_pma(S)                        # (B, n_pma, d)
-
-        # Recent tokens: last n_recent tokens of S
-        S_recent = S[:, -self.n_recent:, :]            # (B, n_recent, d)
-
-        # Combine and gate (Eq. 11)
-        S_cat = torch.cat([S_cls, S_pma, S_recent], dim=1)  # (B, n_cls+n_pma+n_recent, d)
-        S_sum = self.seq_gate(S_cat)                          # element-wise gating
+        S_cat = torch.cat([S_cls, S_pma, S_recent], dim=1)
+        S_sum = self.seq_gate(S_cat)
 
         return S_sum, X_sum
 
@@ -557,22 +477,6 @@ class InterFormer(nn.Module):
 
     Final prediction:
       y_hat = sigmoid(MLP([X_sum^(L) || S_sum^(L)]))
-
-    Args:
-        dense_dim          : raw dense feature dimension
-        sparse_vocab_sizes : list of sparse feature vocabulary sizes
-        seq_len            : T — padded sequence length
-        embed_dim          : d — embedding dimension
-        n_layers           : L — number of InterFormer layers
-        interaction        : interaction module type "fm"|"dcnv2"|"dhen"
-        n_heads            : attention heads
-        n_cls_tokens       : CLS / X_sum token count (paper default: 4)
-        n_pma_tokens       : PMA token count for seq summary (paper default: 2)
-        n_recent_tokens    : recent token count (paper default: 2)
-        ffn_dim            : inner PFFN dimension (default 4*d)
-        n_sequences        : k — number of behavior sequence types
-        dropout            : dropout rate
-        mlp_hidden_dims    : hidden dims for final prediction MLP
     """
     def __init__(
         self,
@@ -597,7 +501,7 @@ class InterFormer(nn.Module):
         n_nonseq = 1 + n_sparse
         n_seq_sum = n_cls_tokens + n_pma_tokens + n_recent_tokens
         mlp_hidden_dims = mlp_hidden_dims or [256, 128]
-        max_seq_len = seq_len + n_cls_tokens  # room for CLS tokens
+        max_seq_len = seq_len + n_cls_tokens
 
         self.n_layers = n_layers
         self.n_cls = n_cls_tokens
@@ -605,14 +509,12 @@ class InterFormer(nn.Module):
         self.embed_dim = embed_dim
         self.seq_len = seq_len
 
-        # --- Preprocessing ---
         self.feature_emb = FeatureEmbedding(dense_dim, sparse_vocab_sizes, embed_dim)
         if seq_vocab_size is None:
             seq_vocab_size = sum(sparse_vocab_sizes) + 1
         self.seq_emb = nn.Embedding(seq_vocab_size, embed_dim, padding_idx=0)
         self.masknet = MaskNet(n_sequences, embed_dim, dropout)
 
-        # --- Stacked layers ---
         self.cross_archs = nn.ModuleList([
             CrossArch(embed_dim, n_nonseq, n_cls_tokens, n_pma_tokens,
                       n_recent_tokens, n_heads, dropout)
@@ -628,8 +530,6 @@ class InterFormer(nn.Module):
             for _ in range(n_layers)
         ])
 
-        # --- Final prediction head ---
-        # Uses X_sum (n_cls * d) + S_sum (n_seq_sum * d)
         final_dim = n_cls_tokens * embed_dim + n_seq_sum * embed_dim
         self.pred_head = MLP(final_dim, mlp_hidden_dims, 1, dropout)
 
@@ -651,61 +551,39 @@ class InterFormer(nn.Module):
         seq_ids: Tensor,
         seq_padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        """
-        Forward pass.
-
-        Args:
-            dense            : (B, dense_dim)
-            sparse_ids       : (B, n_sparse)
-            seq_ids          : (B, T) or (B, k, T)
-            seq_padding_mask : (B, T) bool mask, True = padding
-
-        Returns:
-            logits : (B,)  unnormalized CTR scores
-        """
         B = dense.size(0)
 
-        # ---- Preprocessing ----
-        X = self.feature_emb(dense, sparse_ids)     # (B, n_nonseq, d)
+        X = self.feature_emb(dense, sparse_ids)
 
         if seq_ids.dim() == 2:
             seq_ids = seq_ids.unsqueeze(1)
 
         seqs = []
         for k in range(seq_ids.size(1)):
-            s = self.seq_emb(seq_ids[:, k, :])       # (B, T, d)
+            s = self.seq_emb(seq_ids[:, k, :])
             seqs.append(s)
 
-        S = self.masknet(seqs)                       # (B, T, d)
+        S = self.masknet(seqs)
 
-        # ---- Initial CLS prepend (Algorithm 1 step 3) ----
-        # Compute initial X_sum via LCE + Gating
-        X_t = X.transpose(1, 2)                      # (B, d, n_nonseq)
-        # Use first cross_arch's nonseq summarization
-        X_init = self.cross_archs[0].nonseq_lce(X_t)  # (B, d, n_cls)
-        X_init = X_init.transpose(1, 2)               # (B, n_cls, d)
+        # Initial CLS prepend (Algorithm 1 step 3)
+        X_t = X.transpose(1, 2)
+        X_init = self.cross_archs[0].nonseq_lce(X_t)
+        X_init = X_init.transpose(1, 2)
         X_init = self.cross_archs[0].nonseq_gate(X_init)
         X_sum = X_init
 
-        # Prepend X_sum as CLS tokens to S (only at first layer)
-        S = torch.cat([X_sum, S], dim=1)             # (B, n_cls+T, d)
+        S = torch.cat([X_sum, S], dim=1)
 
-        # ---- Interleaved layers (Algorithm 1 steps 4-8) ----
+        # Interleaved layers (Algorithm 1 steps 4-8)
         S_sum = None
         for cross_arch, inter_arch, seq_arch in zip(
             self.cross_archs, self.interaction_archs, self.sequence_archs
         ):
-            # (a) Cross Arch: compute summaries for current layer
             S_sum, X_sum = cross_arch(X, S)
-
-            # (b) Interaction Arch: behavior-aware non-sequence update
             X = inter_arch(X, S_sum)
-
-            # (c) Sequence Arch: context-aware sequence update
             S = seq_arch(S, X_sum, seq_padding_mask)
 
-        # ---- Prediction head (Algorithm 1 step 9) ----
-        # ŷ = MLP([X_sum^(L) || S_sum^(L)])
+        # Prediction head (Algorithm 1 step 9)
         X_sum_flat = X_sum.reshape(B, -1)
         S_sum_flat = S_sum.reshape(B, -1)
         h = torch.cat([X_sum_flat, S_sum_flat], dim=-1)
@@ -715,174 +593,3 @@ class InterFormer(nn.Module):
 
     def predict_proba(self, *args, **kwargs) -> Tensor:
         return torch.sigmoid(self.forward(*args, **kwargs))
-
-
-# ---------------------------------------------------------------------------
-# 10. Training Utilities
-# ---------------------------------------------------------------------------
-
-class CTRTrainer:
-    """Simple training loop for InterFormer."""
-    def __init__(self, model: InterFormer, lr: float = 1e-3,
-                 weight_decay: float = 1e-5, device: str = "cpu"):
-        self.model = model.to(device)
-        self.device = device
-        self.optimizer = torch.optim.Adam(
-            model.parameters(), lr=lr, weight_decay=weight_decay
-        )
-        self.criterion = nn.BCEWithLogitsLoss()
-        self.history = {"train_loss": [], "val_loss": [], "val_auc": []}
-
-    def train_epoch(self, loader) -> float:
-        self.model.train()
-        total_loss = 0.0
-        for batch in loader:
-            dense, sparse_ids, seq_ids, labels = [b.to(self.device) for b in batch]
-            self.optimizer.zero_grad()
-            logits = self.model(dense, sparse_ids, seq_ids)
-            loss = self.criterion(logits, labels.float())
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            total_loss += loss.item()
-        return total_loss / len(loader)
-
-    @torch.no_grad()
-    def evaluate(self, loader) -> dict:
-        self.model.eval()
-        all_logits, all_labels = [], []
-        total_loss = 0.0
-        for batch in loader:
-            dense, sparse_ids, seq_ids, labels = [b.to(self.device) for b in batch]
-            logits = self.model(dense, sparse_ids, seq_ids)
-            loss = self.criterion(logits, labels.float())
-            total_loss += loss.item()
-            all_logits.append(logits.cpu())
-            all_labels.append(labels.cpu())
-
-        all_logits = torch.cat(all_logits)
-        all_labels = torch.cat(all_labels)
-        probs = torch.sigmoid(all_logits).numpy()
-        labels_np = all_labels.numpy()
-
-        try:
-            from sklearn.metrics import roc_auc_score
-            auc = roc_auc_score(labels_np, probs)
-        except ImportError:
-            auc = float("nan")
-
-        return {"loss": total_loss / len(loader), "auc": auc}
-
-    def fit(self, train_loader, val_loader=None, epochs: int = 10):
-        for epoch in range(1, epochs + 1):
-            train_loss = self.train_epoch(train_loader)
-            self.history["train_loss"].append(train_loss)
-            msg = f"Epoch {epoch:3d} | train_loss={train_loss:.4f}"
-            if val_loader is not None:
-                metrics = self.evaluate(val_loader)
-                self.history["val_loss"].append(metrics["loss"])
-                self.history["val_auc"].append(metrics["auc"])
-                msg += f" | val_loss={metrics['loss']:.4f} | val_auc={metrics['auc']:.4f}"
-            print(msg)
-        return self.history
-
-
-# ---------------------------------------------------------------------------
-# 11. Synthetic Demo
-# ---------------------------------------------------------------------------
-
-def make_synthetic_batch(B: int, dense_dim: int, n_sparse: int,
-                         vocab_size: int, seq_len: int, device: str = "cpu"):
-    dense = torch.randn(B, dense_dim, device=device)
-    sparse_cols = [torch.randint(0, vs, (B,), device=device)
-                   for vs in [100, 200, 150, 300][:n_sparse]]
-    sparse_ids = torch.stack(sparse_cols, dim=1)
-    seq_ids = torch.randint(1, vocab_size, (B, seq_len), device=device)
-    pad_start = int(seq_len * 0.8)
-    seq_padding_mask = torch.zeros(B, seq_len, dtype=torch.bool, device=device)
-    seq_padding_mask[:, pad_start:] = True
-    labels = torch.randint(0, 2, (B,), device=device)
-    return dense, sparse_ids, seq_ids, seq_padding_mask, labels
-
-
-if __name__ == "__main__":
-    torch.manual_seed(42)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}\n")
-
-    DENSE_DIM = 16
-    SPARSE_VOCAB_SIZES = [100, 200, 150, 300]
-    SEQ_LEN = 50
-    EMBED_DIM = 64
-    N_LAYERS = 3
-    BATCH_SIZE = 32
-
-    model = InterFormer(
-        dense_dim=DENSE_DIM,
-        sparse_vocab_sizes=SPARSE_VOCAB_SIZES,
-        seq_len=SEQ_LEN,
-        embed_dim=EMBED_DIM,
-        n_layers=N_LAYERS,
-        interaction="dcnv2",
-        n_heads=4,
-        n_cls_tokens=4,
-        n_pma_tokens=2,
-        n_recent_tokens=2,
-        dropout=0.1,
-        mlp_hidden_dims=[128, 64],
-    )
-
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {total_params:,}\n")
-    print(model)
-    print()
-
-    dense, sparse_ids, seq_ids, pad_mask, labels = make_synthetic_batch(
-        BATCH_SIZE, DENSE_DIM, len(SPARSE_VOCAB_SIZES), 300, SEQ_LEN, device
-    )
-    model = model.to(device)
-    model.eval()
-
-    with torch.no_grad():
-        logits = model(dense, sparse_ids, seq_ids, pad_mask)
-        probs = torch.sigmoid(logits)
-
-    print(f"Input  dense    : {dense.shape}")
-    print(f"Input  sparse   : {sparse_ids.shape}")
-    print(f"Input  sequence : {seq_ids.shape}")
-    print(f"Output logits   : {logits.shape}  range=[{logits.min():.2f}, {logits.max():.2f}]")
-    print(f"Output probs    : {probs.shape}   range=[{probs.min():.3f}, {probs.max():.3f}]")
-    print()
-
-    print("=== Quick training demo (synthetic data) ===")
-    from torch.utils.data import TensorDataset, DataLoader
-
-    N_TRAIN, N_VAL = 2000, 500
-    def gen_dataset(n):
-        d, s, sq, _, y = make_synthetic_batch(
-            n, DENSE_DIM, len(SPARSE_VOCAB_SIZES), 300, SEQ_LEN, "cpu")
-        return TensorDataset(d, s, sq, y)
-
-    train_ds = gen_dataset(N_TRAIN)
-    val_ds = gen_dataset(N_VAL)
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
-
-    model_train = InterFormer(
-        dense_dim=DENSE_DIM,
-        sparse_vocab_sizes=SPARSE_VOCAB_SIZES,
-        seq_len=SEQ_LEN,
-        embed_dim=EMBED_DIM,
-        n_layers=N_LAYERS,
-        interaction="dcnv2",
-        n_heads=4,
-        n_cls_tokens=4,
-        n_pma_tokens=2,
-        n_recent_tokens=2,
-        dropout=0.1,
-        mlp_hidden_dims=[128, 64],
-    )
-    trainer = CTRTrainer(model_train, lr=1e-3, device=device)
-    history = trainer.fit(train_loader, val_loader, epochs=3)
-
-    print("\nDone! InterFormer implementation verified.")
