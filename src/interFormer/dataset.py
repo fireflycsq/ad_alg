@@ -483,6 +483,8 @@ class InterFormerParquetDataset(IterableDataset):
                     padded[padded < 0] = 0
                     if feat['vocab_size'] > 0:
                         padded = padded % feat['vocab_size']
+                    else:
+                        padded[:] = 0
                     seq[:, k, f, :] = padded
                     # Use first domain's first feature's lengths for mask
                     if k == 0 and f == 0:
