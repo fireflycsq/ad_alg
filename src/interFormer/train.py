@@ -57,8 +57,8 @@ def parse_args() -> argparse.Namespace:
                         help='Fraction of Row Groups used for training')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps (0 = epoch-level only)')
-    parser.add_argument('--seq_len', type=int, default=5000,
-                        help='Padded sequence length')
+    parser.add_argument('--seq_len', type=int, default=500,
+                        help='Padded sequence length（云端若 OOM 请调小，如 200）')
     parser.add_argument('--seq_vocab_size', type=int, default=100000,
                         help='Fallback hash bucket size for sequence item IDs')
     parser.add_argument('--max_dense_per_feat', type=int, default=0,

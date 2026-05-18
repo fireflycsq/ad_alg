@@ -95,7 +95,7 @@ class InterFormerParquetDataset(IterableDataset):
         parquet_path: str,
         schema_path: str,
         batch_size: int = 256,
-        seq_len: int = 5000,
+        seq_len: int = 500,
         seq_vocab_size: int = 100000,
         max_dense_per_feat: int = 0,
         item_id_vocab_size: int = 100000,
@@ -481,7 +481,8 @@ class InterFormerParquetDataset(IterableDataset):
                     col = batch.column(feat['col_idx'])
                     padded, lengths = self._pad_varlen_int(col, self.seq_len, B)
                     padded[padded < 0] = 0
-                    padded = padded % feat['vocab_size']
+                    if feat['vocab_size'] > 0:
+                        padded = padded % feat['vocab_size']
                     seq[:, k, f, :] = padded
                     # Use first domain's first feature's lengths for mask
                     if k == 0 and f == 0:
@@ -512,7 +513,7 @@ def get_interformer_data(
     num_workers: int = 0,
     buffer_batches: int = 20,
     seed: int = 42,
-    seq_len: int = 5000,
+    seq_len: int = 500,
     max_dense_per_feat: int = 0,
     seq_vocab_size: int = 100000,
     item_id_vocab_size: int = 100000,

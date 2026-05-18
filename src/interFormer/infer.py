@@ -42,7 +42,7 @@ _FALLBACK_MODEL_CFG: Dict[str, Any] = {
     'n_cls_tokens': 4,
     'n_pma_tokens': 2,
     'n_recent_tokens': 2,
-    'seq_len': 5000,
+    'seq_len': 500,
     'dropout': 0.1,
     'mlp_hidden_dims': '256,128',
 }
