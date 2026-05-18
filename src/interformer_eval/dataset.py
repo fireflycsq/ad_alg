@@ -463,8 +463,9 @@ class InterFormerParquetDataset(IterableDataset):
                 # Store full array for mean-pooling in model
                 if plan['is_array'] and sparse_multi is not None:
                     aidx = plan['array_idx']
-                    sparse_multi[:, aidx, :] = padded
-                    sparse_multi_mask[:, aidx, :] = (padded != 0)
+                    w = min(dim, self.max_array_dim)
+                    sparse_multi[:, aidx, :w] = padded[:, :w]
+                    sparse_multi_mask[:, aidx, :w] = (padded[:, :w] != 0)
 
         # ---- Sequence features: ALL domains, ALL features per domain ----
         n_seqs = self.n_sequences
