@@ -154,22 +154,56 @@ class RoPEMultiheadAttention(nn.Module):
 class FeatureEmbedding(nn.Module):
     """
     Embeds dense + sparse non-sequence features into a unified matrix X^(1).
+
+    Scalar sparse features (dim=1): standard Embedding lookup → 1 token.
+    Array sparse features (dim>1): embed all D elements with shared Embedding,
+    mask padding (value=0), mean-pool → 1 token.
     """
-    def __init__(self, dense_dim: int, sparse_vocab_sizes: List[int], embed_dim: int):
+    def __init__(self, dense_dim: int, sparse_vocab_sizes: List[int],
+                 embed_dim: int, sparse_is_array: Optional[List[bool]] = None,
+                 sparse_multi_dim: Optional[List[int]] = None):
         super().__init__()
         self.dense_proj = nn.Linear(dense_dim, embed_dim)
         self.sparse_embs = nn.ModuleList([
-            nn.Embedding(vs, embed_dim) for vs in sparse_vocab_sizes
+            nn.Embedding(vs, embed_dim, padding_idx=0) for vs in sparse_vocab_sizes
         ])
         self.embed_dim = embed_dim
+        self.is_array = sparse_is_array or [False] * len(sparse_vocab_sizes)
+        self.multi_dim = sparse_multi_dim or [0] * len(sparse_vocab_sizes)
+        self._array_slots: List[Tuple[int, int]] = []
+        _aidx = 0
+        for i, is_arr in enumerate(self.is_array):
+            if is_arr:
+                self._array_slots.append((i, _aidx))
+                _aidx += 1
+        self.n_array_feats = _aidx
 
-    def forward(self, dense: Tensor, sparse_ids: Tensor) -> Tensor:
+    def forward(self, dense: Tensor, sparse_ids: Tensor,
+                sparse_multi: Optional[Tensor] = None,
+                sparse_multi_mask: Optional[Tensor] = None) -> Tensor:
         dense_emb = self.dense_proj(dense).unsqueeze(1)
-        sparse_embs = [
-            self.sparse_embs[i](sparse_ids[:, i]).unsqueeze(1)
-            for i in range(sparse_ids.size(1))
-        ]
-        return torch.cat([dense_emb] + sparse_embs, dim=1)
+
+        tokens = [dense_emb]
+        _aidx_map = {emb_i: aidx for emb_i, aidx in self._array_slots}
+
+        for i in range(len(self.sparse_embs)):
+            if i in _aidx_map and sparse_multi is not None:
+                aidx = _aidx_map[i]
+                vals = sparse_multi[:, aidx, :].long()
+                emb = self.sparse_embs[i](vals)
+                if sparse_multi_mask is not None:
+                    mask = sparse_multi_mask[:, aidx, :].float().unsqueeze(-1)
+                    emb = emb * mask
+                    denom = mask.sum(dim=1).clamp(min=1)
+                    pooled = emb.sum(dim=1) / denom
+                else:
+                    pooled = emb.mean(dim=1)
+                tokens.append(pooled.unsqueeze(1))
+            else:
+                tok = self.sparse_embs[i](sparse_ids[:, i]).unsqueeze(1)
+                tokens.append(tok)
+
+        return torch.cat(tokens, dim=1)
 
 
 class MaskNet(nn.Module):
@@ -493,6 +527,8 @@ class InterFormer(nn.Module):
         ffn_dim: Optional[int] = None,
         n_sequences: int = 1,
         seq_vocab_size: int = None,
+        sparse_is_array: Optional[List[bool]] = None,
+        sparse_multi_dim: Optional[List[int]] = None,
         dropout: float = 0.1,
         mlp_hidden_dims: List[int] = None,
     ):
@@ -509,7 +545,11 @@ class InterFormer(nn.Module):
         self.embed_dim = embed_dim
         self.seq_len = seq_len
 
-        self.feature_emb = FeatureEmbedding(dense_dim, sparse_vocab_sizes, embed_dim)
+        self.feature_emb = FeatureEmbedding(
+            dense_dim, sparse_vocab_sizes, embed_dim,
+            sparse_is_array=sparse_is_array,
+            sparse_multi_dim=sparse_multi_dim,
+        )
         if seq_vocab_size is None:
             seq_vocab_size = sum(sparse_vocab_sizes) + 1
         self.seq_emb = nn.Embedding(seq_vocab_size, embed_dim, padding_idx=0)
@@ -550,10 +590,12 @@ class InterFormer(nn.Module):
         sparse_ids: Tensor,
         seq_ids: Tensor,
         seq_padding_mask: Optional[Tensor] = None,
+        sparse_multi: Optional[Tensor] = None,
+        sparse_multi_mask: Optional[Tensor] = None,
     ) -> Tensor:
         B = dense.size(0)
 
-        X = self.feature_emb(dense, sparse_ids)
+        X = self.feature_emb(dense, sparse_ids, sparse_multi, sparse_multi_mask)
 
         if seq_ids.dim() == 2:
             seq_ids = seq_ids.unsqueeze(1)

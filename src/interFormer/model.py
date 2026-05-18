@@ -171,29 +171,55 @@ class FeatureEmbedding(nn.Module):
     """
     Embeds dense + sparse non-sequence features into a unified matrix X^(1).
 
-    Args:
-        dense_dim          : raw dimension of concatenated dense features
-        sparse_vocab_sizes : list of vocabulary sizes for each sparse feature
-        embed_dim          : output embedding dimension d
-
-    Output: X in R^{(1 + n_sparse) x d}
-            first token = dense projection, rest = sparse embeddings
+    Scalar sparse features (dim=1): standard Embedding lookup → 1 token.
+    Array sparse features (dim>1): embed all D elements with shared Embedding,
+    mask padding (value=0), mean-pool → 1 token.
     """
-    def __init__(self, dense_dim: int, sparse_vocab_sizes: List[int], embed_dim: int):
+    def __init__(self, dense_dim: int, sparse_vocab_sizes: List[int],
+                 embed_dim: int, sparse_is_array: Optional[List[bool]] = None,
+                 sparse_multi_dim: Optional[List[int]] = None):
         super().__init__()
         self.dense_proj = nn.Linear(dense_dim, embed_dim)
         self.sparse_embs = nn.ModuleList([
-            nn.Embedding(vs, embed_dim) for vs in sparse_vocab_sizes
+            nn.Embedding(vs, embed_dim, padding_idx=0) for vs in sparse_vocab_sizes
         ])
         self.embed_dim = embed_dim
+        self.is_array = sparse_is_array or [False] * len(sparse_vocab_sizes)
+        self.multi_dim = sparse_multi_dim or [0] * len(sparse_vocab_sizes)
+        self._array_slots: List[Tuple[int, int]] = []
+        _aidx = 0
+        for i, is_arr in enumerate(self.is_array):
+            if is_arr:
+                self._array_slots.append((i, _aidx))
+                _aidx += 1
+        self.n_array_feats = _aidx
 
-    def forward(self, dense: Tensor, sparse_ids: Tensor) -> Tensor:
+    def forward(self, dense: Tensor, sparse_ids: Tensor,
+                sparse_multi: Optional[Tensor] = None,
+                sparse_multi_mask: Optional[Tensor] = None) -> Tensor:
         dense_emb = self.dense_proj(dense).unsqueeze(1)
-        sparse_embs = [
-            self.sparse_embs[i](sparse_ids[:, i]).unsqueeze(1)
-            for i in range(sparse_ids.size(1))
-        ]
-        return torch.cat([dense_emb] + sparse_embs, dim=1)
+
+        tokens = [dense_emb]
+        _aidx_map = {emb_i: aidx for emb_i, aidx in self._array_slots}
+
+        for i in range(len(self.sparse_embs)):
+            if i in _aidx_map and sparse_multi is not None:
+                aidx = _aidx_map[i]
+                vals = sparse_multi[:, aidx, :].long()
+                emb = self.sparse_embs[i](vals)
+                if sparse_multi_mask is not None:
+                    mask = sparse_multi_mask[:, aidx, :].float().unsqueeze(-1)
+                    emb = emb * mask
+                    denom = mask.sum(dim=1).clamp(min=1)
+                    pooled = emb.sum(dim=1) / denom
+                else:
+                    pooled = emb.mean(dim=1)
+                tokens.append(pooled.unsqueeze(1))
+            else:
+                tok = self.sparse_embs[i](sparse_ids[:, i]).unsqueeze(1)
+                tokens.append(tok)
+
+        return torch.cat(tokens, dim=1)
 
 
 class MaskNet(nn.Module):
@@ -558,10 +584,19 @@ class InterFormer(nn.Module):
     Final prediction:
       y_hat = sigmoid(MLP([X_sum^(L) || S_sum^(L)]))
 
+    Non-sequence features (Section 4.1):
+      X^(1) = [x_dense || x_sparse_user1 || ... || x_sparse_item1 || ...]
+      All user_int, item_int, user_dense, item_dense features concatenated.
+
+    Multi-sequence (Section 4.1, Eq. 6):
+      k sequences (e.g. click, conversion, different platforms) are fused
+      via MaskNet into a single d-dimensional sequence per timestep.
+
     Args:
-        dense_dim          : raw dense feature dimension
-        sparse_vocab_sizes : list of sparse feature vocabulary sizes
+        dense_dim          : raw dense feature dimension (user_dense + item_dense)
+        sparse_vocab_sizes : list of sparse vocab sizes (user_int + item_int)
         seq_len            : T — padded sequence length
+        seq_vocab_sizes    : per-domain sequence vocab sizes for embedding
         embed_dim          : d — embedding dimension
         n_layers           : L — number of InterFormer layers
         interaction        : interaction module type "fm"|"dcnv2"|"dhen"
@@ -569,8 +604,9 @@ class InterFormer(nn.Module):
         n_cls_tokens       : CLS / X_sum token count (paper default: 4)
         n_pma_tokens       : PMA token count for seq summary (paper default: 2)
         n_recent_tokens    : recent token count (paper default: 2)
-        ffn_dim            : inner PFFN dimension (default 4*d)
-        n_sequences        : k — number of behavior sequence types
+        n_sequences        : k — number of behavior sequence domains
+        sparse_is_array    : per-slot bool list for array feature mean-pooling
+        sparse_multi_dim   : per-slot int list of array dims (0 = scalar)
         dropout            : dropout rate
         mlp_hidden_dims    : hidden dims for final prediction MLP
     """
@@ -579,6 +615,7 @@ class InterFormer(nn.Module):
         dense_dim: int,
         sparse_vocab_sizes: List[int],
         seq_len: int,
+        seq_vocab_sizes: List[int] = None,
         embed_dim: int = 64,
         n_layers: int = 3,
         interaction: str = "dcnv2",
@@ -586,9 +623,9 @@ class InterFormer(nn.Module):
         n_cls_tokens: int = 4,
         n_pma_tokens: int = 2,
         n_recent_tokens: int = 2,
-        ffn_dim: Optional[int] = None,
         n_sequences: int = 1,
-        seq_vocab_size: int = None,
+        sparse_is_array: Optional[List[bool]] = None,
+        sparse_multi_dim: Optional[List[int]] = None,
         dropout: float = 0.1,
         mlp_hidden_dims: List[int] = None,
     ):
@@ -597,19 +634,36 @@ class InterFormer(nn.Module):
         n_nonseq = 1 + n_sparse
         n_seq_sum = n_cls_tokens + n_pma_tokens + n_recent_tokens
         mlp_hidden_dims = mlp_hidden_dims or [256, 128]
-        max_seq_len = seq_len + n_cls_tokens  # room for CLS tokens
+        max_seq_len = seq_len + n_cls_tokens
+
+        if seq_vocab_sizes is None:
+            seq_vocab_sizes = [[sum(sparse_vocab_sizes) + 1]]
+        if n_sequences is None:
+            n_sequences = len(seq_vocab_sizes)
 
         self.n_layers = n_layers
         self.n_cls = n_cls_tokens
         self.n_nonseq = n_nonseq
         self.embed_dim = embed_dim
         self.seq_len = seq_len
+        self.n_sequences = n_sequences
 
         # --- Preprocessing ---
-        self.feature_emb = FeatureEmbedding(dense_dim, sparse_vocab_sizes, embed_dim)
-        if seq_vocab_size is None:
-            seq_vocab_size = sum(sparse_vocab_sizes) + 1
-        self.seq_emb = nn.Embedding(seq_vocab_size, embed_dim, padding_idx=0)
+        self.feature_emb = FeatureEmbedding(
+            dense_dim, sparse_vocab_sizes, embed_dim,
+            sparse_is_array=sparse_is_array,
+            sparse_multi_dim=sparse_multi_dim,
+        )
+
+        # Per-domain, per-feature sequence embeddings
+        # seq_embs[d][f] = Embedding for feature f of domain d
+        self.seq_embs = nn.ModuleList([
+            nn.ModuleList([
+                nn.Embedding(vs, embed_dim, padding_idx=0)
+                for vs in domain_vocabs
+            ])
+            for domain_vocabs in seq_vocab_sizes
+        ])
         self.masknet = MaskNet(n_sequences, embed_dim, dropout)
 
         # --- Stacked layers ---
@@ -650,6 +704,8 @@ class InterFormer(nn.Module):
         sparse_ids: Tensor,
         seq_ids: Tensor,
         seq_padding_mask: Optional[Tensor] = None,
+        sparse_multi: Optional[Tensor] = None,
+        sparse_multi_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Forward pass.
@@ -659,6 +715,8 @@ class InterFormer(nn.Module):
             sparse_ids       : (B, n_sparse)
             seq_ids          : (B, T) or (B, k, T)
             seq_padding_mask : (B, T) bool mask, True = padding
+            sparse_multi     : (B, n_array_feats, max_dim)
+            sparse_multi_mask: (B, n_array_feats, max_dim)
 
         Returns:
             logits : (B,)  unnormalized CTR scores
@@ -666,15 +724,23 @@ class InterFormer(nn.Module):
         B = dense.size(0)
 
         # ---- Preprocessing ----
-        X = self.feature_emb(dense, sparse_ids)     # (B, n_nonseq, d)
+        X = self.feature_emb(dense, sparse_ids, sparse_multi, sparse_multi_mask)     # (B, n_nonseq, d)
 
-        if seq_ids.dim() == 2:
-            seq_ids = seq_ids.unsqueeze(1)
-
+        # seq_ids: (B, k, max_feats, T) — k domains × max_feats features × T timesteps
+        # Embed each feature within each domain, sum to get per-domain sequence
         seqs = []
         for k in range(seq_ids.size(1)):
-            s = self.seq_emb(seq_ids[:, k, :])       # (B, T, d)
-            seqs.append(s)
+            # Sum embeddings of all features for domain k
+            s = None
+            n_feats = len(self.seq_embs[k])
+            for f in range(n_feats):
+                feat_ids = seq_ids[:, k, f, :]             # (B, T)
+                feat_emb = self.seq_embs[k][f](feat_ids)   # (B, T, d)
+                if s is None:
+                    s = feat_emb
+                else:
+                    s = s + feat_emb
+            seqs.append(s)                                 # (B, T, d) each
 
         S = self.masknet(seqs)                       # (B, T, d)
 
@@ -817,10 +883,16 @@ if __name__ == "__main__":
     N_LAYERS = 3
     BATCH_SIZE = 32
 
+    N_SEQUENCES = 2
+    # List of lists: per-domain, per-feature vocab sizes
+    SEQ_VOCAB_SIZES = [[300, 300], [300]]
+    MAX_SEQ_FEATS = 2
+
     model = InterFormer(
         dense_dim=DENSE_DIM,
         sparse_vocab_sizes=SPARSE_VOCAB_SIZES,
         seq_len=SEQ_LEN,
+        seq_vocab_sizes=SEQ_VOCAB_SIZES,
         embed_dim=EMBED_DIM,
         n_layers=N_LAYERS,
         interaction="dcnv2",
@@ -828,6 +900,7 @@ if __name__ == "__main__":
         n_cls_tokens=4,
         n_pma_tokens=2,
         n_recent_tokens=2,
+        n_sequences=N_SEQUENCES,
         dropout=0.1,
         mlp_hidden_dims=[128, 64],
     )
@@ -837,9 +910,15 @@ if __name__ == "__main__":
     print(model)
     print()
 
-    dense, sparse_ids, seq_ids, pad_mask, labels = make_synthetic_batch(
+    # Multi-feat multi-seq demo: (B, k, max_feats, T)
+    dense, sparse_ids, seq_ids_1d, pad_mask, labels = make_synthetic_batch(
         BATCH_SIZE, DENSE_DIM, len(SPARSE_VOCAB_SIZES), 300, SEQ_LEN, device
     )
+    seq_ids = torch.zeros(BATCH_SIZE, N_SEQUENCES, MAX_SEQ_FEATS, SEQ_LEN,
+                          dtype=torch.long, device=device)
+    seq_ids[:, 0, 0, :] = seq_ids_1d
+    seq_ids[:, 0, 1, :] = torch.randint(1, 300, (BATCH_SIZE, SEQ_LEN), device=device)
+    seq_ids[:, 1, 0, :] = torch.randint(1, 300, (BATCH_SIZE, SEQ_LEN), device=device)
     model = model.to(device)
     model.eval()
 
@@ -859,8 +938,12 @@ if __name__ == "__main__":
 
     N_TRAIN, N_VAL = 2000, 500
     def gen_dataset(n):
-        d, s, sq, _, y = make_synthetic_batch(
+        d, s, sq_1d, _, y = make_synthetic_batch(
             n, DENSE_DIM, len(SPARSE_VOCAB_SIZES), 300, SEQ_LEN, "cpu")
+        sq = torch.zeros(n, N_SEQUENCES, MAX_SEQ_FEATS, SEQ_LEN, dtype=torch.long)
+        sq[:, 0, 0, :] = sq_1d
+        sq[:, 0, 1, :] = torch.randint(1, 300, (n, SEQ_LEN))
+        sq[:, 1, 0, :] = torch.randint(1, 300, (n, SEQ_LEN))
         return TensorDataset(d, s, sq, y)
 
     train_ds = gen_dataset(N_TRAIN)
@@ -872,6 +955,7 @@ if __name__ == "__main__":
         dense_dim=DENSE_DIM,
         sparse_vocab_sizes=SPARSE_VOCAB_SIZES,
         seq_len=SEQ_LEN,
+        seq_vocab_sizes=SEQ_VOCAB_SIZES,
         embed_dim=EMBED_DIM,
         n_layers=N_LAYERS,
         interaction="dcnv2",
@@ -879,6 +963,7 @@ if __name__ == "__main__":
         n_cls_tokens=4,
         n_pma_tokens=2,
         n_recent_tokens=2,
+        n_sequences=N_SEQUENCES,
         dropout=0.1,
         mlp_hidden_dims=[128, 64],
     )

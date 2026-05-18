@@ -4,12 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
 
-# InterFormer training config:
+# InterFormer local test config:
+#   - seq_len=5000 to cover full sequence lengths (max ~3951 in demo data)
 #   - embed_dim=64 matches PCVRHyFormer d_model
 #   - DHEN interaction: stronger than FM, fewer params than DCNv2 (balanced)
-#   - Bottlenecked InteractionArch output proj (22M→1.7M per layer)
 #   - 3 layers for deeper interaction
-#   - num_workers=0 for local, override with "$@" for cloud (e.g. --num_workers 8)
+#   - num_workers=0 for local testing
 python3 -u "${SCRIPT_DIR}/train.py" \
     --embed_dim 64 \
     --n_layers 3 \
@@ -25,5 +25,6 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --patience 5 \
     --dropout 0.01 \
     --mlp_hidden_dims '256,128' \
-    --num_workers 8 \
+    --seq_len 5000 \
+    --num_workers 0 \
     "$@"

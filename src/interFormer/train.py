@@ -57,14 +57,14 @@ def parse_args() -> argparse.Namespace:
                         help='Fraction of Row Groups used for training')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps (0 = epoch-level only)')
-    parser.add_argument('--seq_domain', type=str, default='domain_a',
-                        help='Sequence domain name in schema')
-    parser.add_argument('--seq_len', type=int, default=100,
+    parser.add_argument('--seq_len', type=int, default=5000,
                         help='Padded sequence length')
     parser.add_argument('--seq_vocab_size', type=int, default=100000,
-                        help='Hash bucket size for sequence item IDs')
-    parser.add_argument('--max_dense_per_feat', type=int, default=32,
-                        help='Max dim per dense feature (downsample)')
+                        help='Fallback hash bucket size for sequence item IDs')
+    parser.add_argument('--max_dense_per_feat', type=int, default=0,
+                        help='Max dim per dense feature (downsample, 0=use schema dim)')
+    parser.add_argument('--item_id_vocab_size', type=int, default=100000,
+                        help='Vocab size for item_id hashing')
 
     # ---- Model hyperparameters ----
     parser.add_argument('--embed_dim', type=int, default=32,
@@ -77,7 +77,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--n_cls_tokens', type=int, default=2)
     parser.add_argument('--n_pma_tokens', type=int, default=1)
     parser.add_argument('--n_recent_tokens', type=int, default=1)
-    parser.add_argument('--n_sequences', type=int, default=1)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--mlp_hidden_dims', type=str, default='64,32',
                         help='Comma-separated hidden dims for prediction head MLP')
@@ -109,6 +108,7 @@ def build_model(args, dataset: InterFormerParquetDataset) -> InterFormer:
         dense_dim=dataset.dense_dim,
         sparse_vocab_sizes=dataset.sparse_vocabs,
         seq_len=args.seq_len,
+        seq_vocab_sizes=dataset.seq_vocab_sizes,
         embed_dim=args.embed_dim,
         n_layers=args.n_layers,
         interaction=args.interaction,
@@ -116,8 +116,9 @@ def build_model(args, dataset: InterFormerParquetDataset) -> InterFormer:
         n_cls_tokens=args.n_cls_tokens,
         n_pma_tokens=args.n_pma_tokens,
         n_recent_tokens=args.n_recent_tokens,
-        n_sequences=args.n_sequences,
-        seq_vocab_size=args.seq_vocab_size,
+        n_sequences=dataset.n_sequences,
+        sparse_is_array=dataset.sparse_is_array,
+        sparse_multi_dim=dataset.sparse_multi_dim,
         dropout=args.dropout,
         mlp_hidden_dims=mlp_hidden_dims,
     )
@@ -162,9 +163,9 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_len=args.seq_len,
-        seq_domain=args.seq_domain,
         max_dense_per_feat=args.max_dense_per_feat,
         seq_vocab_size=args.seq_vocab_size,
+        item_id_vocab_size=args.item_id_vocab_size,
     )
 
     # ---- Build model ----
@@ -172,7 +173,8 @@ def main() -> None:
 
     total_params = count_parameters(model)
     logging.info(f"InterFormer model created: embed_dim={args.embed_dim}, "
-                 f"n_layers={args.n_layers}, interaction={args.interaction}")
+                 f"n_layers={args.n_layers}, interaction={args.interaction}, "
+                 f"n_sequences={train_ds.n_sequences}")
     logging.info(f"Total parameters: {total_params:,}")
 
     # ---- Training ----

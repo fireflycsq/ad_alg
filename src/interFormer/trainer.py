@@ -175,6 +175,8 @@ class InterFormerTrainer:
             device_batch['sparse_ids'],
             device_batch['seq_ids'],
             device_batch.get('seq_padding_mask'),
+            device_batch.get('sparse_multi'),
+            device_batch.get('sparse_multi_mask'),
         )
         loss = self.criterion(logits, label)
         loss.backward()
@@ -253,6 +255,8 @@ class InterFormerTrainer:
                 device_batch['sparse_ids'],
                 device_batch['seq_ids'],
                 device_batch.get('seq_padding_mask'),
+                device_batch.get('sparse_multi'),
+                device_batch.get('sparse_multi_mask'),
             )
             all_logits_list.append(logits.detach().cpu())
             all_labels_list.append(label.detach().cpu())
