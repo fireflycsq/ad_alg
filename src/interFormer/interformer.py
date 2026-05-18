@@ -166,7 +166,7 @@ class FeatureEmbedding(nn.Module):
         super().__init__()
         self.dense_proj = nn.Linear(dense_dim, embed_dim)
         self.sparse_embs = nn.ModuleList([
-            nn.Embedding(vs, embed_dim, padding_idx=0) for vs in sparse_vocab_sizes
+            nn.Embedding(max(vs, 1), embed_dim, padding_idx=0) for vs in sparse_vocab_sizes
         ])
         self.embed_dim = embed_dim
         self.is_array = sparse_is_array or [False] * len(sparse_vocab_sizes)
@@ -589,7 +589,7 @@ class InterFormer(nn.Module):
         # Per-domain, per-feature sequence embeddings
         self.seq_embs = nn.ModuleList([
             nn.ModuleList([
-                nn.Embedding(vs, embed_dim, padding_idx=0)
+                nn.Embedding(max(vs, 1), embed_dim, padding_idx=0)
                 for vs in domain_vocabs
             ])
             for domain_vocabs in seq_vocab_sizes
