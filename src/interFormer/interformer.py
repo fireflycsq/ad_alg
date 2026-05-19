@@ -698,91 +698,8 @@ class InterFormer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 10. Training Utilities
+# 10. Synthetic Demo (model verification only, not for actual training)
 # ---------------------------------------------------------------------------
-
-class CTRTrainer:
-    def __init__(self, model: InterFormer, lr: float = 1e-3,
-                 weight_decay: float = 1e-5, device: str = "cpu"):
-        self.model = model.to(device)
-        self.device = device
-        self.optimizer = torch.optim.Adam(
-            model.parameters(), lr=lr, weight_decay=weight_decay
-        )
-        self.criterion = nn.BCEWithLogitsLoss()
-        self.history = {"train_loss": [], "val_loss": [], "val_auc": []}
-
-    def train_epoch(self, loader) -> float:
-        self.model.train()
-        total_loss = 0.0
-        for batch in loader:
-            dense, sparse_ids, seq_ids, labels = [b.to(self.device) for b in batch]
-            self.optimizer.zero_grad()
-            logits = self.model(dense, sparse_ids, seq_ids)
-            loss = self.criterion(logits, labels.float())
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            total_loss += loss.item()
-        return total_loss / len(loader)
-
-    @torch.no_grad()
-    def evaluate(self, loader) -> dict:
-        self.model.eval()
-        all_logits, all_labels = [], []
-        total_loss = 0.0
-        for batch in loader:
-            dense, sparse_ids, seq_ids, labels = [b.to(self.device) for b in batch]
-            logits = self.model(dense, sparse_ids, seq_ids)
-            loss = self.criterion(logits, labels.float())
-            total_loss += loss.item()
-            all_logits.append(logits.cpu())
-            all_labels.append(labels.cpu())
-
-        all_logits = torch.cat(all_logits)
-        all_labels = torch.cat(all_labels)
-        probs = torch.sigmoid(all_logits).numpy()
-        labels_np = all_labels.numpy()
-
-        try:
-            from sklearn.metrics import roc_auc_score
-            auc = roc_auc_score(labels_np, probs)
-        except ImportError:
-            auc = float("nan")
-
-        return {"loss": total_loss / len(loader), "auc": auc}
-
-    def fit(self, train_loader, val_loader=None, epochs: int = 10):
-        for epoch in range(1, epochs + 1):
-            train_loss = self.train_epoch(train_loader)
-            self.history["train_loss"].append(train_loss)
-            msg = f"Epoch {epoch:3d} | train_loss={train_loss:.4f}"
-            if val_loader is not None:
-                metrics = self.evaluate(val_loader)
-                self.history["val_loss"].append(metrics["loss"])
-                self.history["val_auc"].append(metrics["auc"])
-                msg += f" | val_loss={metrics['loss']:.4f} | val_auc={metrics['auc']:.4f}"
-            print(msg)
-        return self.history
-
-
-# ---------------------------------------------------------------------------
-# 11. Synthetic Demo
-# ---------------------------------------------------------------------------
-
-def make_synthetic_batch(B: int, dense_dim: int, n_sparse: int,
-                         vocab_size: int, seq_len: int, device: str = "cpu"):
-    dense = torch.randn(B, dense_dim, device=device)
-    sparse_cols = [torch.randint(0, vs, (B,), device=device)
-                   for vs in [100, 200, 150, 300][:n_sparse]]
-    sparse_ids = torch.stack(sparse_cols, dim=1)
-    seq_ids = torch.randint(1, vocab_size, (B, seq_len), device=device)
-    pad_start = int(seq_len * 0.8)
-    seq_padding_mask = torch.zeros(B, seq_len, dtype=torch.bool, device=device)
-    seq_padding_mask[:, pad_start:] = True
-    labels = torch.randint(0, 2, (B,), device=device)
-    return dense, sparse_ids, seq_ids, seq_padding_mask, labels
-
 
 if __name__ == "__main__":
     torch.manual_seed(42)
@@ -822,14 +739,19 @@ if __name__ == "__main__":
     print(model)
     print()
 
-    dense, sparse_ids, seq_ids_1d, pad_mask, labels = make_synthetic_batch(
-        BATCH_SIZE, DENSE_DIM, len(SPARSE_VOCAB_SIZES), 300, SEQ_LEN, device
-    )
+    # Build synthetic multi-seq multi-feat input inline
+    dense = torch.randn(BATCH_SIZE, DENSE_DIM, device=device)
+    sparse_ids = torch.stack([
+        torch.randint(0, vs, (BATCH_SIZE,), device=device)
+        for vs in SPARSE_VOCAB_SIZES
+    ], dim=1)
     seq_ids = torch.zeros(BATCH_SIZE, N_SEQUENCES, MAX_SEQ_FEATS, SEQ_LEN,
                           dtype=torch.long, device=device)
-    seq_ids[:, 0, 0, :] = seq_ids_1d
+    seq_ids[:, 0, 0, :] = torch.randint(1, 300, (BATCH_SIZE, SEQ_LEN), device=device)
     seq_ids[:, 0, 1, :] = torch.randint(1, 300, (BATCH_SIZE, SEQ_LEN), device=device)
     seq_ids[:, 1, 0, :] = torch.randint(1, 300, (BATCH_SIZE, SEQ_LEN), device=device)
+    pad_mask = torch.zeros(BATCH_SIZE, SEQ_LEN, dtype=torch.bool, device=device)
+    pad_mask[:, int(SEQ_LEN * 0.8):] = True
     model = model.to(device)
     model.eval()
 
@@ -841,44 +763,5 @@ if __name__ == "__main__":
     print(f"Input  sparse   : {sparse_ids.shape}")
     print(f"Input  sequence : {seq_ids.shape}")
     print(f"Output logits   : {logits.shape}  range=[{logits.min():.2f}, {logits.max():.2f}]")
-    print(f"Output probs    : {probs.shape}   range=[{probs.min():.3f}, {probs.max():.3f}]")
-    print()
-
-    print("=== Quick training demo (synthetic data) ===")
-    from torch.utils.data import TensorDataset, DataLoader
-
-    N_TRAIN, N_VAL = 2000, 500
-    def gen_dataset(n):
-        d, s, sq_1d, _, y = make_synthetic_batch(
-            n, DENSE_DIM, len(SPARSE_VOCAB_SIZES), 300, SEQ_LEN, "cpu")
-        sq = torch.zeros(n, N_SEQUENCES, MAX_SEQ_FEATS, SEQ_LEN, dtype=torch.long)
-        sq[:, 0, 0, :] = sq_1d
-        sq[:, 0, 1, :] = torch.randint(1, 300, (n, SEQ_LEN))
-        sq[:, 1, 0, :] = torch.randint(1, 300, (n, SEQ_LEN))
-        return TensorDataset(d, s, sq, y)
-
-    train_ds = gen_dataset(N_TRAIN)
-    val_ds = gen_dataset(N_VAL)
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
-
-    model_train = InterFormer(
-        dense_dim=DENSE_DIM,
-        sparse_vocab_sizes=SPARSE_VOCAB_SIZES,
-        seq_len=SEQ_LEN,
-        seq_vocab_sizes=SEQ_VOCAB_SIZES,
-        embed_dim=EMBED_DIM,
-        n_layers=N_LAYERS,
-        interaction="dcnv2",
-        n_heads=4,
-        n_cls_tokens=4,
-        n_pma_tokens=2,
-        n_recent_tokens=2,
-        n_sequences=N_SEQUENCES,
-        dropout=0.1,
-        mlp_hidden_dims=[128, 64],
-    )
-    trainer = CTRTrainer(model_train, lr=1e-3, device=device)
-    history = trainer.fit(train_loader, val_loader, epochs=3)
-
+    print("Output probs    :", probs.shape, "  range=[{:.3f}, {:.3f}]".format(probs.min().item(), probs.max().item()))
     print("\nDone! InterFormer implementation verified.")

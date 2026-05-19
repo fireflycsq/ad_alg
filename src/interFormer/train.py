@@ -124,7 +124,6 @@ def build_model(args, dataset: InterFormerParquetDataset) -> InterFormer:
         sparse_is_array=dataset.sparse_is_array,
         sparse_multi_dim=dataset.sparse_multi_dim,
         emb_skip_threshold=args.emb_skip_threshold,
-        emb_skip_threshold=emb_skip_threshold,
         dropout=args.dropout,
         mlp_hidden_dims=mlp_hidden_dims,
     )

@@ -104,6 +104,7 @@ def build_model_from_cfg(
     dataset: InterFormerParquetDataset,
     model_cfg: Dict[str, Any],
     device: str = 'cpu',
+    emb_skip_threshold: int = 0,
 ) -> nn.Module:
     """Rebuild an InterFormer matching the training architecture."""
     from model import InterFormer  # deferred import — avoids ckpt coupling
@@ -199,7 +200,7 @@ def main() -> None:
     logging.info("Test samples: %s", test_dataset.num_rows)
 
     # ---- Build model ----
-    model = build_model_from_cfg(test_dataset, model_cfg, device)
+    model = build_model_from_cfg(test_dataset, model_cfg, device, emb_skip_threshold)
 
     # ---- Load weights ----
     ckpt_path = find_ckpt(model_dir)
