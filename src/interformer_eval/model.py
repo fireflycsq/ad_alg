@@ -244,15 +244,38 @@ class MaskNet(nn.Module):
 # ---------------------------------------------------------------------------
 
 class FMInteraction(nn.Module):
-    """Inner-product based interaction (FM style)."""
+    """Factorization Machine interaction (Section 3.2).
+
+    Standard FM formula:
+      f_FM = 0.5 * [(Σ x_i)² - Σ(x_i²)]  +  W·x  +  b
+             \______ second-order ______/    \_ first _/  \_ bias
+
+    Input:  X ∈ R^{B × N × d}   (N tokens, each d-dim)
+    Output: X ∈ R^{B × N × d}   (FM interaction broadcast to all tokens)
+    """
     def __init__(self, embed_dim: int):
         super().__init__()
-        self.embed_dim = embed_dim
+        self.first_order = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim, bias=True),  # w_j x_j + w_0
+            nn.SiLU(),
+        )
+        self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, X: Tensor) -> Tensor:
-        scores = torch.bmm(X, X.transpose(1, 2)) / math.sqrt(self.embed_dim)
-        weights = torch.softmax(scores, dim=-1)
-        return torch.bmm(weights, X)
+        B, N, d = X.shape
+
+        # Second-order FM: 0.5 * [(sum x_i)^2 - sum(x_i^2)]
+        sum_all = X.sum(dim=1)                       # (B, d)
+        sum_sq = sum_all.pow(2)                       # (B, d)
+        sq_sum = X.pow(2).sum(dim=1)                   # (B, d)
+        second_order = 0.5 * (sum_sq - sq_sum)         # (B, d)
+
+        # First-order: per-token linear, then mean-pool
+        first_order = self.first_order(X).mean(dim=1)  # (B, d)
+
+        fm = second_order + first_order                 # (B, d)
+        fm = self.norm(fm)
+        return fm.unsqueeze(1).expand(-1, N, -1)        # (B, N, d)
 
 
 class DCNv2Interaction(nn.Module):
@@ -285,11 +308,34 @@ class DCNv2Interaction(nn.Module):
         return out.reshape(B, n, d)
 
 
+class AttentionInteraction(nn.Module):
+    """Multi-Head Self-Attention for feature interaction (Section 3.3).
+
+    Input:  X ∈ R^{B × N × d}
+    Output: X ∈ R^{B × N × d}
+    """
+    def __init__(self, embed_dim: int, n_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        assert embed_dim % n_heads == 0
+        self.mha = nn.MultiheadAttention(embed_dim, n_heads, dropout=dropout,
+                                         batch_first=True)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, X: Tensor) -> Tensor:
+        out, _ = self.mha(X, X, X)
+        return self.norm(out + X)
+
+
 class DHENInteraction(nn.Module):
-    """Deep Hierarchical Ensemble Network (Section 3.2)."""
+    """Deep Hierarchical Ensemble Network (Section 3.2).
+
+    Ensembles Attention + MLP + shortcut, matching the paper's hierarchical
+    interaction design. Uses Attention (Section 3.3) instead of FM for the
+    ensemble branch.
+    """
     def __init__(self, n_tokens: int, embed_dim: int, dropout: float = 0.1):
         super().__init__()
-        self.fm = FMInteraction(embed_dim)
+        self.attn = AttentionInteraction(embed_dim, dropout=dropout)
         flat_dim = n_tokens * embed_dim
         self.mlp = MLP(flat_dim, [flat_dim], flat_dim, dropout)
         self.shortcut = nn.Linear(flat_dim, flat_dim)
@@ -299,10 +345,10 @@ class DHENInteraction(nn.Module):
 
     def forward(self, X: Tensor) -> Tensor:
         B, n, d = X.shape
-        fm_out = self.fm(X)
+        attn_out = self.attn(X)
         flat = X.reshape(B, -1)
         mlp_out = self.mlp(flat).reshape(B, n, d)
-        ensemble = (fm_out + mlp_out) / 2
+        ensemble = (attn_out + mlp_out) / 2
         shortcut = self.shortcut(flat).reshape(B, n, d)
         out = self.norm((ensemble + shortcut).reshape(B, -1))
         return out.reshape(B, n, d)
@@ -312,6 +358,8 @@ def build_interaction(name: str, n_tokens: int, embed_dim: int,
                       **kwargs) -> nn.Module:
     if name == "fm":
         return FMInteraction(embed_dim)
+    elif name == "attn":
+        return AttentionInteraction(embed_dim, **kwargs)
     elif name == "dcnv2":
         return DCNv2Interaction(n_tokens, embed_dim, **kwargs)
     elif name == "dhen":
