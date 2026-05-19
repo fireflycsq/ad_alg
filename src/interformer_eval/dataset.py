@@ -99,6 +99,7 @@ class InterFormerParquetDataset(IterableDataset):
         seq_vocab_size: int = 100000,
         max_dense_per_feat: int = 0,
         item_id_vocab_size: int = 100000,
+        emb_skip_threshold: int = 0,
         shuffle: bool = True,
         buffer_batches: int = 20,
         row_group_range: Optional[Tuple[int, int]] = None,
@@ -120,6 +121,7 @@ class InterFormerParquetDataset(IterableDataset):
         self.seq_vocab_size = seq_vocab_size
         self.max_dense_per_feat = max_dense_per_feat
         self.item_id_vocab_size = item_id_vocab_size
+        self.emb_skip_threshold = emb_skip_threshold
         self.shuffle = shuffle
         self.buffer_batches = buffer_batches
         self.is_training = is_training
@@ -450,15 +452,16 @@ class InterFormerParquetDataset(IterableDataset):
             dim = plan['dim']
             slot = plan['slot']
             vs = plan['vocab_size']
+            vs_eff = min(vs, self.emb_skip_threshold) if self.emb_skip_threshold > 0 and vs > 0 else vs
             col = batch.column(ci)
             if dim == 1:
                 arr = col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
                 arr[arr <= 0] = 0
-                arr[arr >= vs] = 0
+                arr[arr >= vs_eff] = 0
                 sparse[:, slot] = arr
             else:
                 padded, _ = self._pad_varlen_int(col, dim, B)
-                padded[padded >= vs] = 0
+                padded[padded >= vs_eff] = 0
                 sparse[:, slot] = padded[:, 0]
                 # Store full array for mean-pooling in model
                 if plan['is_array'] and sparse_multi is not None:
@@ -481,8 +484,9 @@ class InterFormerParquetDataset(IterableDataset):
                     col = batch.column(feat['col_idx'])
                     padded, lengths = self._pad_varlen_int(col, self.seq_len, B)
                     padded[padded < 0] = 0
-                    if feat['vocab_size'] > 0:
-                        padded = padded % feat['vocab_size']
+                    vs_seq = min(feat['vocab_size'], self.emb_skip_threshold) if self.emb_skip_threshold > 0 and feat['vocab_size'] > 0 else feat['vocab_size']
+                    if vs_seq > 0:
+                        padded = padded % vs_seq
                     else:
                         padded[:] = 0
                     seq[:, k, f, :] = padded
@@ -519,6 +523,7 @@ def get_interformer_data(
     max_dense_per_feat: int = 0,
     seq_vocab_size: int = 100000,
     item_id_vocab_size: int = 100000,
+    emb_skip_threshold: int = 0,
 ) -> Tuple[DataLoader, DataLoader, InterFormerParquetDataset]:
     """Create train / valid DataLoaders using Row Group split.
 
@@ -556,6 +561,7 @@ def get_interformer_data(
         seq_vocab_size=seq_vocab_size,
         max_dense_per_feat=max_dense_per_feat,
         item_id_vocab_size=item_id_vocab_size,
+        emb_skip_threshold=emb_skip_threshold,
         shuffle=True,
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
@@ -570,6 +576,7 @@ def get_interformer_data(
         seq_vocab_size=seq_vocab_size,
         max_dense_per_feat=max_dense_per_feat,
         item_id_vocab_size=item_id_vocab_size,
+        emb_skip_threshold=emb_skip_threshold,
         shuffle=False,
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),

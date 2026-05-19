@@ -159,20 +159,27 @@ class FeatureEmbedding(nn.Module):
     Scalar sparse features (dim=1): standard Embedding lookup → 1 token.
     Array sparse features (dim>1): embed all D elements with shared Embedding,
     mask padding (value=0), mean-pool → 1 token.
+
+    emb_skip_threshold: cap vocab sizes to this value (0=disabled).
+    Matches PCVR's emb_skip_threshold to prevent OOM on high-cardinality features.
     """
     def __init__(self, dense_dim: int, sparse_vocab_sizes: List[int],
                  embed_dim: int, sparse_is_array: Optional[List[bool]] = None,
-                 sparse_multi_dim: Optional[List[int]] = None):
+                 sparse_multi_dim: Optional[List[int]] = None,
+                 emb_skip_threshold: int = 0):
         super().__init__()
         self.dense_proj = nn.Linear(dense_dim, embed_dim)
+        self.emb_skip_threshold = emb_skip_threshold
         self.sparse_embs = nn.ModuleList([
-            nn.Embedding(max(vs, 1), embed_dim, padding_idx=0) for vs in sparse_vocab_sizes
+            nn.Embedding(
+                min(vs, emb_skip_threshold) if emb_skip_threshold > 0 and vs > 0 else max(vs, 1),
+                embed_dim, padding_idx=0,
+            ) for vs in sparse_vocab_sizes
         ])
         self.embed_dim = embed_dim
         self.is_array = sparse_is_array or [False] * len(sparse_vocab_sizes)
         self.multi_dim = sparse_multi_dim or [0] * len(sparse_vocab_sizes)
-        # Pre-compute array_idx counter for forward pass
-        self._array_slots: List[Tuple[int, int]] = []  # [(emb_idx, array_idx), ...]
+        self._array_slots: List[Tuple[int, int]] = []
         _aidx = 0
         for i, is_arr in enumerate(self.is_array):
             if is_arr:
@@ -558,6 +565,7 @@ class InterFormer(nn.Module):
         n_sequences: int = 1,
         sparse_is_array: Optional[List[bool]] = None,
         sparse_multi_dim: Optional[List[int]] = None,
+        emb_skip_threshold: int = 0,
         dropout: float = 0.1,
         mlp_hidden_dims: List[int] = None,
     ):
@@ -584,12 +592,16 @@ class InterFormer(nn.Module):
             dense_dim, sparse_vocab_sizes, embed_dim,
             sparse_is_array=sparse_is_array,
             sparse_multi_dim=sparse_multi_dim,
+            emb_skip_threshold=emb_skip_threshold,
         )
 
         # Per-domain, per-feature sequence embeddings
         self.seq_embs = nn.ModuleList([
             nn.ModuleList([
-                nn.Embedding(max(vs, 1), embed_dim, padding_idx=0)
+                nn.Embedding(
+                    min(vs, emb_skip_threshold) if emb_skip_threshold > 0 and vs > 0 else max(vs, 1),
+                    embed_dim, padding_idx=0,
+                )
                 for vs in domain_vocabs
             ])
             for domain_vocabs in seq_vocab_sizes

@@ -52,6 +52,7 @@ _FALLBACK_DATA_CFG: Dict[str, Any] = {
     'seq_vocab_size': 100000,
     'item_id_vocab_size': 100000,
     'max_dense_per_feat': 0,
+    'emb_skip_threshold': 500000,
 }
 
 _MODEL_CFG_KEYS = list(_FALLBACK_MODEL_CFG.keys())
@@ -132,6 +133,7 @@ def build_model_from_cfg(
         n_sequences=dataset.n_sequences,
         sparse_is_array=dataset.sparse_is_array,
         sparse_multi_dim=dataset.sparse_multi_dim,
+        emb_skip_threshold=emb_skip_threshold,
         dropout=model_cfg['dropout'],
         mlp_hidden_dims=mlp_dims,
     ).to(device)
@@ -173,6 +175,7 @@ def main() -> None:
     seq_vocab_size = int(train_config.get('seq_vocab_size', _FALLBACK_DATA_CFG['seq_vocab_size']))
     item_id_vocab_size = int(train_config.get('item_id_vocab_size', _FALLBACK_DATA_CFG['item_id_vocab_size']))
     max_dense_per_feat = int(train_config.get('max_dense_per_feat', _FALLBACK_DATA_CFG['max_dense_per_feat']))
+    emb_skip_threshold = int(train_config.get('emb_skip_threshold', _FALLBACK_DATA_CFG['emb_skip_threshold']))
 
     # ---- Dataset (single-parquet inference: all rows as test) ----
     test_dataset = InterFormerParquetDataset(
@@ -183,6 +186,7 @@ def main() -> None:
         seq_vocab_size=seq_vocab_size,
         max_dense_per_feat=max_dense_per_feat,
         item_id_vocab_size=item_id_vocab_size,
+        emb_skip_threshold=emb_skip_threshold,
         shuffle=False,
         buffer_batches=0,
         is_training=False,
