@@ -343,8 +343,6 @@ def build_interaction(name: str, n_tokens: int, embed_dim: int,
                       **kwargs) -> nn.Module:
     if name == "fm":
         return FMInteraction(n_tokens, embed_dim)
-    elif name == "attn":
-        return AttentionInteraction(embed_dim, **kwargs)
     elif name == "dcnv2":
         return DCNv2Interaction(n_tokens, embed_dim, **kwargs)
     elif name == "dhen":
