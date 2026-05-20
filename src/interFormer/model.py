@@ -244,38 +244,39 @@ class MaskNet(nn.Module):
 # ---------------------------------------------------------------------------
 
 class FMInteraction(nn.Module):
-    """Factorization Machine interaction (Section 3.2).
+    """Factorization Machine interaction (Section 3.2) — scalar output.
 
-    Standard FM formula:
-      f_FM = 0.5 * [(Σ x_i)² - Σ(x_i²)]  +  W·x  +  b
-             \______ second-order ______/    \_ first _/  \_ bias
+    Standard FM on N tokens each with d-dim embedding:
+      Input:  X ∈ R^{B × N × d}
+      Flatten to R^{N*d}, each position is a feature with scalar value.
+      Latent vectors V ∈ R^{(N*d) × k} learned per position.
+      Output: scalar per sample ∈ R^{B}
 
-    Input:  X ∈ R^{B × N × d}   (N tokens, each d-dim)
-    Output: X ∈ R^{B × N × d}   (FM interaction broadcast to all tokens)
+    Formula:
+      second_order = 0.5 * (‖Σ_i V_i·x_i‖² - Σ_i ‖V_i·x_i‖²)
+      first_order  = W·x_flat + b
+      f_FM = second_order + first_order
     """
-    def __init__(self, embed_dim: int):
+    def __init__(self, n_tokens: int, embed_dim: int):
         super().__init__()
-        self.first_order = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim, bias=True),  # w_j x_j + w_0
-            nn.SiLU(),
-        )
-        self.norm = nn.LayerNorm(embed_dim)
+        flat_dim = n_tokens * embed_dim
+        self.V = nn.Parameter(torch.randn(flat_dim, embed_dim) * 0.01)
+        self.linear = nn.Linear(flat_dim, 1, bias=True)
 
     def forward(self, X: Tensor) -> Tensor:
         B, N, d = X.shape
+        x = X.reshape(B, -1)                        # (B, N*d)
 
-        # Second-order FM: 0.5 * [(sum x_i)^2 - sum(x_i^2)]
-        sum_all = X.sum(dim=1)                       # (B, d)
-        sum_sq = sum_all.pow(2)                       # (B, d)
-        sq_sum = X.pow(2).sum(dim=1)                   # (B, d)
-        second_order = 0.5 * (sum_sq - sq_sum)         # (B, d)
+        # Second-order: 0.5 * (‖Σ V_i x_i‖² - Σ ‖V_i x_i‖²)
+        vx = x.unsqueeze(-1) * self.V.unsqueeze(0)   # (B, N*d, k)
+        sum_vx = vx.sum(dim=1)                        # (B, k)
+        second_order = 0.5 * (sum_vx.pow(2).sum(-1)   # ‖Σ V_i x_i‖²
+                              - vx.pow(2).sum(dim=(1, 2)))  # Σ ‖V_i x_i‖²
 
-        # First-order: per-token linear, then mean-pool
-        first_order = self.first_order(X).mean(dim=1)  # (B, d)
+        # First-order + bias
+        first_order = self.linear(x).squeeze(-1)      # (B,)
 
-        fm = second_order + first_order                 # (B, d)
-        fm = self.norm(fm)
-        return fm.unsqueeze(1).expand(-1, N, -1)        # (B, N, d)
+        return second_order + first_order              # (B,) scalar
 
 
 class DCNv2Interaction(nn.Module):
@@ -308,23 +309,6 @@ class DCNv2Interaction(nn.Module):
         return out.reshape(B, n, d)
 
 
-class AttentionInteraction(nn.Module):
-    """Multi-Head Self-Attention for feature interaction (Section 3.3).
-
-    Input:  X ∈ R^{B × N × d}
-    Output: X ∈ R^{B × N × d}
-    """
-    def __init__(self, embed_dim: int, n_heads: int = 4, dropout: float = 0.1):
-        super().__init__()
-        assert embed_dim % n_heads == 0
-        self.mha = nn.MultiheadAttention(embed_dim, n_heads, dropout=dropout,
-                                         batch_first=True)
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, X: Tensor) -> Tensor:
-        out, _ = self.mha(X, X, X)
-        return self.norm(out + X)
-
 
 class DHENInteraction(nn.Module):
     """Deep Hierarchical Ensemble Network (Section 3.2).
@@ -335,7 +319,7 @@ class DHENInteraction(nn.Module):
     """
     def __init__(self, n_tokens: int, embed_dim: int, dropout: float = 0.1):
         super().__init__()
-        self.attn = AttentionInteraction(embed_dim, dropout=dropout)
+        self.fm = FMInteraction(n_tokens, embed_dim)
         flat_dim = n_tokens * embed_dim
         self.mlp = MLP(flat_dim, [flat_dim], flat_dim, dropout)
         self.shortcut = nn.Linear(flat_dim, flat_dim)
@@ -345,10 +329,11 @@ class DHENInteraction(nn.Module):
 
     def forward(self, X: Tensor) -> Tensor:
         B, n, d = X.shape
-        attn_out = self.attn(X)
+        fm_out_flat = self.fm(X)                        # (B,) scalar
+        fm_out = fm_out_flat.unsqueeze(1).unsqueeze(2).expand(-1, n, d)  # (B, n, d)
         flat = X.reshape(B, -1)
         mlp_out = self.mlp(flat).reshape(B, n, d)
-        ensemble = (attn_out + mlp_out) / 2
+        ensemble = (fm_out + mlp_out) / 2
         shortcut = self.shortcut(flat).reshape(B, n, d)
         out = self.norm((ensemble + shortcut).reshape(B, -1))
         return out.reshape(B, n, d)
@@ -357,7 +342,7 @@ class DHENInteraction(nn.Module):
 def build_interaction(name: str, n_tokens: int, embed_dim: int,
                       **kwargs) -> nn.Module:
     if name == "fm":
-        return FMInteraction(embed_dim)
+        return FMInteraction(n_tokens, embed_dim)
     elif name == "attn":
         return AttentionInteraction(embed_dim, **kwargs)
     elif name == "dcnv2":
@@ -460,7 +445,8 @@ class InteractionArch(nn.Module):
         n_total = n_nonseq_tokens + n_sum_tokens
         self.interaction = build_interaction(interaction, n_total, embed_dim,
                                              dropout=dropout)
-        flat_in = n_total * embed_dim
+        self.is_fm = (interaction == "fm")
+        flat_in = 1 if self.is_fm else n_total * embed_dim
         flat_out = n_nonseq_tokens * embed_dim
         bottleneck = embed_dim * 4
         self.out_proj = nn.Sequential(
@@ -478,7 +464,10 @@ class InteractionArch(nn.Module):
         B = X.size(0)
         X_cat = torch.cat([X, S_sum], dim=1)
         X_inter = self.interaction(X_cat)
-        flat = X_inter.reshape(B, -1)
+        if self.is_fm:
+            flat = X_inter.unsqueeze(-1)              # (B, 1)
+        else:
+            flat = X_inter.reshape(B, -1)
         out = self.out_proj(flat).reshape(B, self.n_nonseq, self.embed_dim)
         return self.norm(out)
 
