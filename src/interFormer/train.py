@@ -57,14 +57,18 @@ def parse_args() -> argparse.Namespace:
                         help='Fraction of Row Groups used for training')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps (0 = epoch-level only)')
-    parser.add_argument('--seq_len', type=int, default=5000,
-                        help='Padded sequence length')
+    parser.add_argument('--seq_len', type=int, default=500,
+                        help='Padded sequence length（云端若 OOM 请调小，如 200）')
     parser.add_argument('--seq_vocab_size', type=int, default=100000,
                         help='Fallback hash bucket size for sequence item IDs')
     parser.add_argument('--max_dense_per_feat', type=int, default=0,
                         help='Max dim per dense feature (downsample, 0=use schema dim)')
     parser.add_argument('--item_id_vocab_size', type=int, default=100000,
                         help='Vocab size for item_id hashing')
+    parser.add_argument('--emb_skip_threshold', type=int, default=500000,
+                        help='Cap vocab size for embeddings (0=disabled). '
+                             'Prevents OOM from high-cardinality features. '
+                             'Matches PCVR emb_skip_threshold.')
 
     # ---- Model hyperparameters ----
     parser.add_argument('--embed_dim', type=int, default=32,
@@ -119,6 +123,7 @@ def build_model(args, dataset: InterFormerParquetDataset) -> InterFormer:
         n_sequences=dataset.n_sequences,
         sparse_is_array=dataset.sparse_is_array,
         sparse_multi_dim=dataset.sparse_multi_dim,
+        emb_skip_threshold=args.emb_skip_threshold,
         dropout=args.dropout,
         mlp_hidden_dims=mlp_hidden_dims,
     )
@@ -166,6 +171,7 @@ def main() -> None:
         max_dense_per_feat=args.max_dense_per_feat,
         seq_vocab_size=args.seq_vocab_size,
         item_id_vocab_size=args.item_id_vocab_size,
+        emb_skip_threshold=args.emb_skip_threshold,
     )
 
     # ---- Build model ----

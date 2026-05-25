@@ -42,7 +42,7 @@ _FALLBACK_MODEL_CFG: Dict[str, Any] = {
     'n_cls_tokens': 4,
     'n_pma_tokens': 2,
     'n_recent_tokens': 2,
-    'seq_len': 5000,
+    'seq_len': 500,
     'dropout': 0.1,
     'mlp_hidden_dims': '256,128',
 }
@@ -52,6 +52,7 @@ _FALLBACK_DATA_CFG: Dict[str, Any] = {
     'seq_vocab_size': 100000,
     'item_id_vocab_size': 100000,
     'max_dense_per_feat': 0,
+    'emb_skip_threshold': 500000,
 }
 
 _MODEL_CFG_KEYS = list(_FALLBACK_MODEL_CFG.keys())
@@ -103,6 +104,7 @@ def build_model_from_cfg(
     dataset: InterFormerParquetDataset,
     model_cfg: Dict[str, Any],
     device: str = 'cpu',
+    emb_skip_threshold: int = 0,
 ) -> nn.Module:
     """Rebuild an InterFormer matching the training architecture."""
     from model import InterFormer  # deferred import — avoids ckpt coupling
@@ -132,6 +134,7 @@ def build_model_from_cfg(
         n_sequences=dataset.n_sequences,
         sparse_is_array=dataset.sparse_is_array,
         sparse_multi_dim=dataset.sparse_multi_dim,
+        emb_skip_threshold=emb_skip_threshold,
         dropout=model_cfg['dropout'],
         mlp_hidden_dims=mlp_dims,
     ).to(device)
@@ -173,6 +176,7 @@ def main() -> None:
     seq_vocab_size = int(train_config.get('seq_vocab_size', _FALLBACK_DATA_CFG['seq_vocab_size']))
     item_id_vocab_size = int(train_config.get('item_id_vocab_size', _FALLBACK_DATA_CFG['item_id_vocab_size']))
     max_dense_per_feat = int(train_config.get('max_dense_per_feat', _FALLBACK_DATA_CFG['max_dense_per_feat']))
+    emb_skip_threshold = int(train_config.get('emb_skip_threshold', _FALLBACK_DATA_CFG['emb_skip_threshold']))
 
     # ---- Dataset (single-parquet inference: all rows as test) ----
     test_dataset = InterFormerParquetDataset(
@@ -183,6 +187,7 @@ def main() -> None:
         seq_vocab_size=seq_vocab_size,
         max_dense_per_feat=max_dense_per_feat,
         item_id_vocab_size=item_id_vocab_size,
+        emb_skip_threshold=emb_skip_threshold,
         shuffle=False,
         buffer_batches=0,
         is_training=False,
@@ -195,7 +200,7 @@ def main() -> None:
     logging.info("Test samples: %s", test_dataset.num_rows)
 
     # ---- Build model ----
-    model = build_model_from_cfg(test_dataset, model_cfg, device)
+    model = build_model_from_cfg(test_dataset, model_cfg, device, emb_skip_threshold)
 
     # ---- Load weights ----
     ckpt_path = find_ckpt(model_dir)

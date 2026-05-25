@@ -25,6 +25,6 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --patience 5 \
     --dropout 0.01 \
     --mlp_hidden_dims '256,128' \
-    --seq_len 5000 \
+    --seq_len 500 \
     --num_workers 0 \
     "$@"

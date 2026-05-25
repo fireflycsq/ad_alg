@@ -159,20 +159,27 @@ class FeatureEmbedding(nn.Module):
     Scalar sparse features (dim=1): standard Embedding lookup → 1 token.
     Array sparse features (dim>1): embed all D elements with shared Embedding,
     mask padding (value=0), mean-pool → 1 token.
+
+    emb_skip_threshold: cap vocab sizes to this value (0=disabled).
+    Matches PCVR's emb_skip_threshold to prevent OOM on high-cardinality features.
     """
     def __init__(self, dense_dim: int, sparse_vocab_sizes: List[int],
                  embed_dim: int, sparse_is_array: Optional[List[bool]] = None,
-                 sparse_multi_dim: Optional[List[int]] = None):
+                 sparse_multi_dim: Optional[List[int]] = None,
+                 emb_skip_threshold: int = 0):
         super().__init__()
         self.dense_proj = nn.Linear(dense_dim, embed_dim)
+        self.emb_skip_threshold = emb_skip_threshold
         self.sparse_embs = nn.ModuleList([
-            nn.Embedding(vs, embed_dim, padding_idx=0) for vs in sparse_vocab_sizes
+            nn.Embedding(
+                min(vs, emb_skip_threshold) if emb_skip_threshold > 0 and vs > 0 else max(vs, 1),
+                embed_dim, padding_idx=0,
+            ) for vs in sparse_vocab_sizes
         ])
         self.embed_dim = embed_dim
         self.is_array = sparse_is_array or [False] * len(sparse_vocab_sizes)
         self.multi_dim = sparse_multi_dim or [0] * len(sparse_vocab_sizes)
-        # Pre-compute array_idx counter for forward pass
-        self._array_slots: List[Tuple[int, int]] = []  # [(emb_idx, array_idx), ...]
+        self._array_slots: List[Tuple[int, int]] = []
         _aidx = 0
         for i, is_arr in enumerate(self.is_array):
             if is_arr:
@@ -237,15 +244,38 @@ class MaskNet(nn.Module):
 # ---------------------------------------------------------------------------
 
 class FMInteraction(nn.Module):
-    """Inner-product based interaction (FM style)."""
+    """Factorization Machine interaction (Section 3.2).
+
+    Standard FM formula:
+      f_FM = 0.5 * [(Σ x_i)² - Σ(x_i²)]  +  W·x  +  b
+             \______ second-order ______/    \_ first _/  \_ bias
+
+    Input:  X ∈ R^{B × N × d}   (N tokens, each d-dim)
+    Output: X ∈ R^{B × N × d}   (FM interaction broadcast to all tokens)
+    """
     def __init__(self, embed_dim: int):
         super().__init__()
-        self.embed_dim = embed_dim
+        self.first_order = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim, bias=True),  # w_j x_j + w_0
+            nn.SiLU(),
+        )
+        self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, X: Tensor) -> Tensor:
-        scores = torch.bmm(X, X.transpose(1, 2)) / math.sqrt(self.embed_dim)
-        weights = torch.softmax(scores, dim=-1)
-        return torch.bmm(weights, X)
+        B, N, d = X.shape
+
+        # Second-order FM: 0.5 * [(sum x_i)^2 - sum(x_i^2)]
+        sum_all = X.sum(dim=1)                       # (B, d)
+        sum_sq = sum_all.pow(2)                       # (B, d)
+        sq_sum = X.pow(2).sum(dim=1)                   # (B, d)
+        second_order = 0.5 * (sum_sq - sq_sum)         # (B, d)
+
+        # First-order: per-token linear, then mean-pool
+        first_order = self.first_order(X).mean(dim=1)  # (B, d)
+
+        fm = second_order + first_order                 # (B, d)
+        fm = self.norm(fm)
+        return fm.unsqueeze(1).expand(-1, N, -1)        # (B, N, d)
 
 
 class DCNv2Interaction(nn.Module):
@@ -278,11 +308,34 @@ class DCNv2Interaction(nn.Module):
         return out.reshape(B, n, d)
 
 
+class AttentionInteraction(nn.Module):
+    """Multi-Head Self-Attention for feature interaction (Section 3.3).
+
+    Input:  X ∈ R^{B × N × d}
+    Output: X ∈ R^{B × N × d}
+    """
+    def __init__(self, embed_dim: int, n_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        assert embed_dim % n_heads == 0
+        self.mha = nn.MultiheadAttention(embed_dim, n_heads, dropout=dropout,
+                                         batch_first=True)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, X: Tensor) -> Tensor:
+        out, _ = self.mha(X, X, X)
+        return self.norm(out + X)
+
+
 class DHENInteraction(nn.Module):
-    """Deep Hierarchical Ensemble Network (Section 3.2)."""
+    """Deep Hierarchical Ensemble Network (Section 3.2).
+
+    Ensembles Attention + MLP + shortcut, matching the paper's hierarchical
+    interaction design. Uses Attention (Section 3.3) instead of FM for the
+    ensemble branch.
+    """
     def __init__(self, n_tokens: int, embed_dim: int, dropout: float = 0.1):
         super().__init__()
-        self.fm = FMInteraction(embed_dim)
+        self.attn = AttentionInteraction(embed_dim, dropout=dropout)
         flat_dim = n_tokens * embed_dim
         self.mlp = MLP(flat_dim, [flat_dim], flat_dim, dropout)
         self.shortcut = nn.Linear(flat_dim, flat_dim)
@@ -292,10 +345,10 @@ class DHENInteraction(nn.Module):
 
     def forward(self, X: Tensor) -> Tensor:
         B, n, d = X.shape
-        fm_out = self.fm(X)
+        attn_out = self.attn(X)
         flat = X.reshape(B, -1)
         mlp_out = self.mlp(flat).reshape(B, n, d)
-        ensemble = (fm_out + mlp_out) / 2
+        ensemble = (attn_out + mlp_out) / 2
         shortcut = self.shortcut(flat).reshape(B, n, d)
         out = self.norm((ensemble + shortcut).reshape(B, -1))
         return out.reshape(B, n, d)
@@ -305,6 +358,8 @@ def build_interaction(name: str, n_tokens: int, embed_dim: int,
                       **kwargs) -> nn.Module:
     if name == "fm":
         return FMInteraction(embed_dim)
+    elif name == "attn":
+        return AttentionInteraction(embed_dim, **kwargs)
     elif name == "dcnv2":
         return DCNv2Interaction(n_tokens, embed_dim, **kwargs)
     elif name == "dhen":
@@ -558,6 +613,7 @@ class InterFormer(nn.Module):
         n_sequences: int = 1,
         sparse_is_array: Optional[List[bool]] = None,
         sparse_multi_dim: Optional[List[int]] = None,
+        emb_skip_threshold: int = 0,
         dropout: float = 0.1,
         mlp_hidden_dims: List[int] = None,
     ):
@@ -584,12 +640,16 @@ class InterFormer(nn.Module):
             dense_dim, sparse_vocab_sizes, embed_dim,
             sparse_is_array=sparse_is_array,
             sparse_multi_dim=sparse_multi_dim,
+            emb_skip_threshold=emb_skip_threshold,
         )
 
         # Per-domain, per-feature sequence embeddings
         self.seq_embs = nn.ModuleList([
             nn.ModuleList([
-                nn.Embedding(vs, embed_dim, padding_idx=0)
+                nn.Embedding(
+                    min(vs, emb_skip_threshold) if emb_skip_threshold > 0 and vs > 0 else max(vs, 1),
+                    embed_dim, padding_idx=0,
+                )
                 for vs in domain_vocabs
             ])
             for domain_vocabs in seq_vocab_sizes
@@ -686,91 +746,8 @@ class InterFormer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 10. Training Utilities
+# 10. Synthetic Demo (model verification only, not for actual training)
 # ---------------------------------------------------------------------------
-
-class CTRTrainer:
-    def __init__(self, model: InterFormer, lr: float = 1e-3,
-                 weight_decay: float = 1e-5, device: str = "cpu"):
-        self.model = model.to(device)
-        self.device = device
-        self.optimizer = torch.optim.Adam(
-            model.parameters(), lr=lr, weight_decay=weight_decay
-        )
-        self.criterion = nn.BCEWithLogitsLoss()
-        self.history = {"train_loss": [], "val_loss": [], "val_auc": []}
-
-    def train_epoch(self, loader) -> float:
-        self.model.train()
-        total_loss = 0.0
-        for batch in loader:
-            dense, sparse_ids, seq_ids, labels = [b.to(self.device) for b in batch]
-            self.optimizer.zero_grad()
-            logits = self.model(dense, sparse_ids, seq_ids)
-            loss = self.criterion(logits, labels.float())
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            total_loss += loss.item()
-        return total_loss / len(loader)
-
-    @torch.no_grad()
-    def evaluate(self, loader) -> dict:
-        self.model.eval()
-        all_logits, all_labels = [], []
-        total_loss = 0.0
-        for batch in loader:
-            dense, sparse_ids, seq_ids, labels = [b.to(self.device) for b in batch]
-            logits = self.model(dense, sparse_ids, seq_ids)
-            loss = self.criterion(logits, labels.float())
-            total_loss += loss.item()
-            all_logits.append(logits.cpu())
-            all_labels.append(labels.cpu())
-
-        all_logits = torch.cat(all_logits)
-        all_labels = torch.cat(all_labels)
-        probs = torch.sigmoid(all_logits).numpy()
-        labels_np = all_labels.numpy()
-
-        try:
-            from sklearn.metrics import roc_auc_score
-            auc = roc_auc_score(labels_np, probs)
-        except ImportError:
-            auc = float("nan")
-
-        return {"loss": total_loss / len(loader), "auc": auc}
-
-    def fit(self, train_loader, val_loader=None, epochs: int = 10):
-        for epoch in range(1, epochs + 1):
-            train_loss = self.train_epoch(train_loader)
-            self.history["train_loss"].append(train_loss)
-            msg = f"Epoch {epoch:3d} | train_loss={train_loss:.4f}"
-            if val_loader is not None:
-                metrics = self.evaluate(val_loader)
-                self.history["val_loss"].append(metrics["loss"])
-                self.history["val_auc"].append(metrics["auc"])
-                msg += f" | val_loss={metrics['loss']:.4f} | val_auc={metrics['auc']:.4f}"
-            print(msg)
-        return self.history
-
-
-# ---------------------------------------------------------------------------
-# 11. Synthetic Demo
-# ---------------------------------------------------------------------------
-
-def make_synthetic_batch(B: int, dense_dim: int, n_sparse: int,
-                         vocab_size: int, seq_len: int, device: str = "cpu"):
-    dense = torch.randn(B, dense_dim, device=device)
-    sparse_cols = [torch.randint(0, vs, (B,), device=device)
-                   for vs in [100, 200, 150, 300][:n_sparse]]
-    sparse_ids = torch.stack(sparse_cols, dim=1)
-    seq_ids = torch.randint(1, vocab_size, (B, seq_len), device=device)
-    pad_start = int(seq_len * 0.8)
-    seq_padding_mask = torch.zeros(B, seq_len, dtype=torch.bool, device=device)
-    seq_padding_mask[:, pad_start:] = True
-    labels = torch.randint(0, 2, (B,), device=device)
-    return dense, sparse_ids, seq_ids, seq_padding_mask, labels
-
 
 if __name__ == "__main__":
     torch.manual_seed(42)
@@ -810,14 +787,19 @@ if __name__ == "__main__":
     print(model)
     print()
 
-    dense, sparse_ids, seq_ids_1d, pad_mask, labels = make_synthetic_batch(
-        BATCH_SIZE, DENSE_DIM, len(SPARSE_VOCAB_SIZES), 300, SEQ_LEN, device
-    )
+    # Build synthetic multi-seq multi-feat input inline
+    dense = torch.randn(BATCH_SIZE, DENSE_DIM, device=device)
+    sparse_ids = torch.stack([
+        torch.randint(0, vs, (BATCH_SIZE,), device=device)
+        for vs in SPARSE_VOCAB_SIZES
+    ], dim=1)
     seq_ids = torch.zeros(BATCH_SIZE, N_SEQUENCES, MAX_SEQ_FEATS, SEQ_LEN,
                           dtype=torch.long, device=device)
-    seq_ids[:, 0, 0, :] = seq_ids_1d
+    seq_ids[:, 0, 0, :] = torch.randint(1, 300, (BATCH_SIZE, SEQ_LEN), device=device)
     seq_ids[:, 0, 1, :] = torch.randint(1, 300, (BATCH_SIZE, SEQ_LEN), device=device)
     seq_ids[:, 1, 0, :] = torch.randint(1, 300, (BATCH_SIZE, SEQ_LEN), device=device)
+    pad_mask = torch.zeros(BATCH_SIZE, SEQ_LEN, dtype=torch.bool, device=device)
+    pad_mask[:, int(SEQ_LEN * 0.8):] = True
     model = model.to(device)
     model.eval()
 
@@ -829,44 +811,5 @@ if __name__ == "__main__":
     print(f"Input  sparse   : {sparse_ids.shape}")
     print(f"Input  sequence : {seq_ids.shape}")
     print(f"Output logits   : {logits.shape}  range=[{logits.min():.2f}, {logits.max():.2f}]")
-    print(f"Output probs    : {probs.shape}   range=[{probs.min():.3f}, {probs.max():.3f}]")
-    print()
-
-    print("=== Quick training demo (synthetic data) ===")
-    from torch.utils.data import TensorDataset, DataLoader
-
-    N_TRAIN, N_VAL = 2000, 500
-    def gen_dataset(n):
-        d, s, sq_1d, _, y = make_synthetic_batch(
-            n, DENSE_DIM, len(SPARSE_VOCAB_SIZES), 300, SEQ_LEN, "cpu")
-        sq = torch.zeros(n, N_SEQUENCES, MAX_SEQ_FEATS, SEQ_LEN, dtype=torch.long)
-        sq[:, 0, 0, :] = sq_1d
-        sq[:, 0, 1, :] = torch.randint(1, 300, (n, SEQ_LEN))
-        sq[:, 1, 0, :] = torch.randint(1, 300, (n, SEQ_LEN))
-        return TensorDataset(d, s, sq, y)
-
-    train_ds = gen_dataset(N_TRAIN)
-    val_ds = gen_dataset(N_VAL)
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
-
-    model_train = InterFormer(
-        dense_dim=DENSE_DIM,
-        sparse_vocab_sizes=SPARSE_VOCAB_SIZES,
-        seq_len=SEQ_LEN,
-        seq_vocab_sizes=SEQ_VOCAB_SIZES,
-        embed_dim=EMBED_DIM,
-        n_layers=N_LAYERS,
-        interaction="dcnv2",
-        n_heads=4,
-        n_cls_tokens=4,
-        n_pma_tokens=2,
-        n_recent_tokens=2,
-        n_sequences=N_SEQUENCES,
-        dropout=0.1,
-        mlp_hidden_dims=[128, 64],
-    )
-    trainer = CTRTrainer(model_train, lr=1e-3, device=device)
-    history = trainer.fit(train_loader, val_loader, epochs=3)
-
+    print("Output probs    :", probs.shape, "  range=[{:.3f}, {:.3f}]".format(probs.min().item(), probs.max().item()))
     print("\nDone! InterFormer implementation verified.")

@@ -16,58 +16,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 import torch.multiprocessing
-from torch.utils.data import Dataset, DataLoader, IterableDataset
+from torch.utils.data import IterableDataset, DataLoader
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 torch.multiprocessing.set_sharing_strategy('file_system')
-
-
-class CTRDataset(Dataset):
-    """CTR dataset for InterFormer."""
-
-    def __init__(self, dense, sparse_ids, seq_ids, labels, seq_padding_mask=None):
-        self.dense = dense
-        self.sparse_ids = sparse_ids
-        self.seq_ids = seq_ids
-        self.labels = labels
-        self.seq_padding_mask = seq_padding_mask
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        if self.seq_padding_mask is not None:
-            return (
-                self.dense[idx], self.sparse_ids[idx], self.seq_ids[idx],
-                self.seq_padding_mask[idx], self.labels[idx]
-            )
-        else:
-            return (
-                self.dense[idx], self.sparse_ids[idx], self.seq_ids[idx],
-                self.labels[idx]
-            )
-
-
-def make_synthetic_batch(B: int, dense_dim: int, n_sparse: int,
-                         vocab_size: int, seq_len: int, device: str = "cpu"):
-    """Generate a random batch for quick testing."""
-    dense = torch.randn(B, dense_dim, device=device)
-    sparse_vocab_sizes = [100, 200, 150, 300][:n_sparse]
-    sparse_cols = [torch.randint(0, vs, (B,), device=device) for vs in sparse_vocab_sizes]
-    sparse_ids = torch.stack(sparse_cols, dim=1)
-    seq_ids = torch.randint(1, vocab_size, (B, seq_len), device=device)
-    pad_start = int(seq_len * 0.8)
-    seq_padding_mask = torch.zeros(B, seq_len, dtype=torch.bool, device=device)
-    seq_padding_mask[:, pad_start:] = True
-    labels = torch.randint(0, 2, (B,), device=device)
-    return dense, sparse_ids, seq_ids, seq_padding_mask, labels
-
-
-def create_dataloaders(train_data, val_data, batch_size=64):
-    """Create dataloaders for training and validation."""
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False)
-    return train_loader, val_loader
 
 
 # ---------------------------------------------------------------------------
@@ -95,10 +47,11 @@ class InterFormerParquetDataset(IterableDataset):
         parquet_path: str,
         schema_path: str,
         batch_size: int = 256,
-        seq_len: int = 5000,
+        seq_len: int = 500,
         seq_vocab_size: int = 100000,
         max_dense_per_feat: int = 0,
         item_id_vocab_size: int = 100000,
+        emb_skip_threshold: int = 0,
         shuffle: bool = True,
         buffer_batches: int = 20,
         row_group_range: Optional[Tuple[int, int]] = None,
@@ -120,6 +73,7 @@ class InterFormerParquetDataset(IterableDataset):
         self.seq_vocab_size = seq_vocab_size
         self.max_dense_per_feat = max_dense_per_feat
         self.item_id_vocab_size = item_id_vocab_size
+        self.emb_skip_threshold = emb_skip_threshold
         self.shuffle = shuffle
         self.buffer_batches = buffer_batches
         self.is_training = is_training
@@ -450,21 +404,23 @@ class InterFormerParquetDataset(IterableDataset):
             dim = plan['dim']
             slot = plan['slot']
             vs = plan['vocab_size']
+            vs_eff = min(vs, self.emb_skip_threshold) if self.emb_skip_threshold > 0 and vs > 0 else vs
             col = batch.column(ci)
             if dim == 1:
                 arr = col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
                 arr[arr <= 0] = 0
-                arr[arr >= vs] = 0
+                arr[arr >= vs_eff] = 0
                 sparse[:, slot] = arr
             else:
                 padded, _ = self._pad_varlen_int(col, dim, B)
-                padded[padded >= vs] = 0
+                padded[padded >= vs_eff] = 0
                 sparse[:, slot] = padded[:, 0]
                 # Store full array for mean-pooling in model
                 if plan['is_array'] and sparse_multi is not None:
                     aidx = plan['array_idx']
-                    sparse_multi[:, aidx, :] = padded
-                    sparse_multi_mask[:, aidx, :] = (padded != 0)
+                    w = min(dim, self.max_array_dim)
+                    sparse_multi[:, aidx, :w] = padded[:, :w]
+                    sparse_multi_mask[:, aidx, :w] = (padded[:, :w] != 0)
 
         # ---- Sequence features: ALL domains, ALL features per domain ----
         n_seqs = self.n_sequences
@@ -480,7 +436,11 @@ class InterFormerParquetDataset(IterableDataset):
                     col = batch.column(feat['col_idx'])
                     padded, lengths = self._pad_varlen_int(col, self.seq_len, B)
                     padded[padded < 0] = 0
-                    padded = padded % feat['vocab_size']
+                    vs_seq = min(feat['vocab_size'], self.emb_skip_threshold) if self.emb_skip_threshold > 0 and feat['vocab_size'] > 0 else feat['vocab_size']
+                    if vs_seq > 0:
+                        padded = padded % vs_seq
+                    else:
+                        padded[:] = 0
                     seq[:, k, f, :] = padded
                     # Use first domain's first feature's lengths for mask
                     if k == 0 and f == 0:
@@ -511,10 +471,11 @@ def get_interformer_data(
     num_workers: int = 0,
     buffer_batches: int = 20,
     seed: int = 42,
-    seq_len: int = 5000,
+    seq_len: int = 500,
     max_dense_per_feat: int = 0,
     seq_vocab_size: int = 100000,
     item_id_vocab_size: int = 100000,
+    emb_skip_threshold: int = 0,
 ) -> Tuple[DataLoader, DataLoader, InterFormerParquetDataset]:
     """Create train / valid DataLoaders using Row Group split.
 
@@ -552,6 +513,7 @@ def get_interformer_data(
         seq_vocab_size=seq_vocab_size,
         max_dense_per_feat=max_dense_per_feat,
         item_id_vocab_size=item_id_vocab_size,
+        emb_skip_threshold=emb_skip_threshold,
         shuffle=True,
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
@@ -566,6 +528,7 @@ def get_interformer_data(
         seq_vocab_size=seq_vocab_size,
         max_dense_per_feat=max_dense_per_feat,
         item_id_vocab_size=item_id_vocab_size,
+        emb_skip_threshold=emb_skip_threshold,
         shuffle=False,
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
