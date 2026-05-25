@@ -11,25 +11,18 @@ Architecture Overview:
   Final CTR score = sigmoid(MLP([X_sum^(L) || S_sum^(L)]))
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 
 # ---------------------------------------------------------------------------
 # 1. Utilities
 # ---------------------------------------------------------------------------
 
-class LayerNorm(nn.LayerNorm):
-    """Standard LayerNorm wrapper."""
-    pass
-
-
 class MLP(nn.Module):
-    """Multi-layer perceptron with optional dropout. Uses Swish/SiLU per paper."""
     def __init__(self, in_dim: int, hidden_dims: List[int], out_dim: int,
                  dropout: float = 0.1, activation: str = "silu"):
         super().__init__()
@@ -364,7 +357,7 @@ class PMA(nn.Module):
         super().__init__()
         self.seeds = nn.Parameter(torch.randn(k_seeds, embed_dim))
         self.mha = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True)
-        self.norm = LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, S: Tensor) -> Tensor:
         B = S.size(0)
@@ -418,7 +411,7 @@ class PFFN(nn.Module):
             nn.SiLU(),
             nn.Linear(embed_dim * 2, embed_dim * embed_dim),
         )
-        self.norm = LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
         self.embed_dim = embed_dim
 
     def forward(self, X_sum: Tensor, S: Tensor) -> Tensor:
@@ -454,7 +447,7 @@ class InteractionArch(nn.Module):
             nn.Linear(bottleneck, flat_out),
             nn.LayerNorm(flat_out),
         )
-        self.norm = LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
         self.n_nonseq = n_nonseq_tokens
         self.embed_dim = embed_dim
 

@@ -1,4 +1,4 @@
-"""InterFormer inference script.
+"""OneTrans inference script.
 
 Rebuilds the model from ``schema.json`` + ``train_config.json`` at the
 checkpoint directory, loads the saved ``model.pt`` weights, and produces
@@ -18,13 +18,14 @@ Environment variables:
 import os
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import InterFormerParquetDataset, get_interformer_data
+from dataset import PCVRParquetDataset, FeatureSchema
+from model import OneTrans
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,27 +33,23 @@ logging.basicConfig(
 )
 
 # ---------------------------------------------------------------------------
-# Fallbacks — must stay in sync with train.py argparse defaults
+# Fallbacks — must stay in sync with one_trans/train.py argparse defaults
 # ---------------------------------------------------------------------------
 _FALLBACK_MODEL_CFG: Dict[str, Any] = {
-    'embed_dim': 64,
-    'n_layers': 3,
-    'interaction': 'dhen',
-    'n_heads': 8,
-    'n_cls_tokens': 4,
-    'n_pma_tokens': 2,
-    'n_recent_tokens': 2,
-    'seq_len': 512,
-    'dropout': 0.01,
-    'mlp_hidden_dims': '128,64',
+    'd_model': 256,
+    'emb_dim': 16,
+    'num_layers': 6,
+    'num_heads': 4,
+    'num_ns_tokens': 12,
+    'hidden_mult': 4,
+    'dropout': 0.0,
+    'emb_skip_threshold': 0,
 }
 _FALLBACK_DATA_CFG: Dict[str, Any] = {
-    'batch_size': 256,
+    'batch_size': 32,
     'num_workers': 0,
-    'seq_vocab_size': 100000,
-    'item_id_vocab_size': 100000,
-    'max_dense_per_feat': 0,
-    'emb_skip_threshold': 500000,
+    'buffer_batches': 5,
+    'seq_max_lens': {'domain_a': 50, 'domain_b': 50, 'domain_c': 50, 'domain_d': 50},
 }
 
 _MODEL_CFG_KEYS = list(_FALLBACK_MODEL_CFG.keys())
@@ -84,10 +81,11 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def find_ckpt(model_dir: str) -> str:
-    """Return the first ``*.pt`` file in *model_dir*."""
-    for name in os.listdir(model_dir):
-        if name.endswith('.pt'):
-            return os.path.join(model_dir, name)
+    """Return the first ``*.pt`` file found recursively in *model_dir*."""
+    for root, _dirs, files in os.walk(model_dir):
+        for name in files:
+            if name.endswith('.pt'):
+                return os.path.join(root, name)
     raise FileNotFoundError(
         f"No *.pt file found in {model_dir}. "
         f"Contents: {os.listdir(model_dir)}")
@@ -100,44 +98,65 @@ def load_state_dict_strict(model: nn.Module, ckpt_path: str, device: str) -> Non
     logging.info("Loaded weights from %s", ckpt_path)
 
 
+def build_feature_specs(
+    schema: FeatureSchema, per_position_vocab_sizes: List[int],
+) -> List[Tuple[int, int, int]]:
+    """Build (vocab_size, offset, length) specs from a FeatureSchema."""
+    specs = []
+    for fid, offset, length in schema.entries:
+        vs = max(per_position_vocab_sizes[offset:offset + length])
+        specs.append((vs, offset, length))
+    return specs
+
+
 def build_model_from_cfg(
-    dataset: InterFormerParquetDataset,
+    dataset: PCVRParquetDataset,
     model_cfg: Dict[str, Any],
     device: str = 'cpu',
-    emb_skip_threshold: int = 0,
+    seq_max_lens: Optional[Dict[str, int]] = None,
 ) -> nn.Module:
-    """Rebuild an InterFormer matching the training architecture."""
-    from model import InterFormer  # deferred import — avoids ckpt coupling
-
-    mlp_dims = [int(x.strip()) for x in model_cfg['mlp_hidden_dims'].split(',')]
+    """Rebuild a OneTrans model matching the training architecture."""
+    user_int_specs = build_feature_specs(
+        dataset.user_int_schema, dataset.user_int_vocab_sizes)
+    item_int_specs = build_feature_specs(
+        dataset.item_int_schema, dataset.item_int_vocab_sizes)
 
     logging.info(
-        "Building InterFormer: embed_dim=%(embed_dim)s, n_layers=%(n_layers)s, "
-        "interaction=%(interaction)s, n_heads=%(n_heads)s, "
-        "n_cls=%(n_cls_tokens)s, n_pma=%(n_pma_tokens)s, "
-        "n_recent=%(n_recent_tokens)s, seq_len=%(seq_len)s",
+        "Building OneTrans: d_model=%(d_model)s, emb_dim=%(emb_dim)s, "
+        "num_layers=%(num_layers)s, num_heads=%(num_heads)s, "
+        "num_ns_tokens=%(num_ns_tokens)s, hidden_mult=%(hidden_mult)s, "
+        "dropout=%(dropout)s, emb_skip_threshold=%(emb_skip_threshold)s",
         model_cfg,
     )
 
-    model = InterFormer(
-        dense_dim=dataset.dense_dim,
-        sparse_vocab_sizes=dataset.sparse_vocabs,
-        seq_len=model_cfg['seq_len'],
-        seq_vocab_sizes=dataset.seq_vocab_sizes,
-        embed_dim=model_cfg['embed_dim'],
-        n_layers=model_cfg['n_layers'],
-        interaction=model_cfg['interaction'],
-        n_heads=model_cfg['n_heads'],
-        n_cls_tokens=model_cfg['n_cls_tokens'],
-        n_pma_tokens=model_cfg['n_pma_tokens'],
-        n_recent_tokens=model_cfg['n_recent_tokens'],
-        n_sequences=dataset.n_sequences,
-        sparse_is_array=dataset.sparse_is_array,
-        sparse_multi_dim=dataset.sparse_multi_dim,
-        emb_skip_threshold=emb_skip_threshold,
+    model = OneTrans(
+        user_int_feature_specs=user_int_specs,
+        item_int_feature_specs=item_int_specs,
+        user_dense_dim=dataset.user_dense_schema.total_dim,
+        item_dense_dim=dataset.item_dense_schema.total_dim,
+        seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
+        d_model=model_cfg['d_model'],
+        emb_dim=model_cfg['emb_dim'],
+        num_layers=model_cfg['num_layers'],
+        num_heads=model_cfg['num_heads'],
+        num_ns_tokens=model_cfg['num_ns_tokens'],
+        hidden_mult=model_cfg['hidden_mult'],
         dropout=model_cfg['dropout'],
-        mlp_hidden_dims=mlp_dims,
+        emb_skip_threshold=model_cfg['emb_skip_threshold'],
     ).to(device)
+
+    # Eagerly build blocks so state_dict keys exist before weight loading.
+    # L_S = sum of per-domain max_lens + (n_domains - 1) SEP tokens
+    if dataset.seq_domains:
+        if seq_max_lens:
+            total_s = sum(seq_max_lens.get(d, 50) for d in dataset.seq_domains)
+        else:
+            total_s = len(dataset.seq_domains) * 50
+        L_S = total_s + max(0, len(dataset.seq_domains) - 1)
+    else:
+        L_S = 0
+    model._build_blocks(L_S, device)
+
     return model
 
 
@@ -173,21 +192,18 @@ def main() -> None:
 
     batch_size = int(train_config.get('batch_size', _FALLBACK_DATA_CFG['batch_size']))
     num_workers = int(train_config.get('num_workers', _FALLBACK_DATA_CFG['num_workers']))
-    seq_vocab_size = int(train_config.get('seq_vocab_size', _FALLBACK_DATA_CFG['seq_vocab_size']))
-    item_id_vocab_size = int(train_config.get('item_id_vocab_size', _FALLBACK_DATA_CFG['item_id_vocab_size']))
-    max_dense_per_feat = int(train_config.get('max_dense_per_feat', _FALLBACK_DATA_CFG['max_dense_per_feat']))
-    emb_skip_threshold = int(train_config.get('emb_skip_threshold', _FALLBACK_DATA_CFG['emb_skip_threshold']))
+    buffer_batches = int(train_config.get('buffer_batches', _FALLBACK_DATA_CFG['buffer_batches']))
+    seq_max_lens = train_config.get('seq_max_lens', _FALLBACK_DATA_CFG['seq_max_lens'])
+    if isinstance(seq_max_lens, str):
+        seq_max_lens = {k.strip(): int(v.strip()) for k, v in
+                        (pair.split(':') for pair in seq_max_lens.split(','))}
 
-    # ---- Dataset (single-parquet inference: all rows as test) ----
-    test_dataset = InterFormerParquetDataset(
+    # ---- Dataset (all row groups as test, no shuffle) ----
+    test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
         batch_size=batch_size,
-        seq_len=model_cfg['seq_len'],
-        seq_vocab_size=seq_vocab_size,
-        max_dense_per_feat=max_dense_per_feat,
-        item_id_vocab_size=item_id_vocab_size,
-        emb_skip_threshold=emb_skip_threshold,
+        seq_max_lens=seq_max_lens,
         shuffle=False,
         buffer_batches=0,
         is_training=False,
@@ -200,7 +216,7 @@ def main() -> None:
     logging.info("Test samples: %s", test_dataset.num_rows)
 
     # ---- Build model ----
-    model = build_model_from_cfg(test_dataset, model_cfg, device, emb_skip_threshold)
+    model = build_model_from_cfg(test_dataset, model_cfg, device, seq_max_lens)
 
     # ---- Load weights ----
     ckpt_path = find_ckpt(model_dir)
@@ -214,21 +230,29 @@ def main() -> None:
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(test_loader):
-            dense = batch['dense'].to(device, non_blocking=True)
-            sparse_ids = batch['sparse_ids'].to(device, non_blocking=True)
-            seq_ids = batch['seq_ids'].to(device, non_blocking=True)
-            seq_mask = batch['seq_padding_mask'].to(device, non_blocking=True)
-            sparse_multi = batch.get('sparse_multi')
-            sparse_multi_mask = batch.get('sparse_multi_mask')
-            if sparse_multi is not None:
-                sparse_multi = sparse_multi.to(device, non_blocking=True)
-                sparse_multi_mask = sparse_multi_mask.to(device, non_blocking=True)
+            user_int = batch['user_int_feats'].to(device, non_blocking=True)
+            item_int = batch['item_int_feats'].to(device, non_blocking=True)
+            user_dense = batch['user_dense_feats'].to(device, non_blocking=True)
+            item_dense = batch['item_dense_feats'].to(device, non_blocking=True)
+
+            seq_data = {}
+            seq_lens = {}
+            seq_domains = batch.get('_seq_domains', [])
+            for domain in seq_domains:
+                seq_data[domain] = batch[domain].to(device, non_blocking=True)
+                seq_lens[domain] = batch[f'{domain}_len'].to(device, non_blocking=True)
 
             user_ids = batch['user_id']
 
-            logits = model(dense, sparse_ids, seq_ids, seq_mask,
-                           sparse_multi, sparse_multi_mask)
-            probs = torch.sigmoid(logits).cpu().numpy()
+            logits, _ = model.predict(
+                user_int_feats=user_int,
+                item_int_feats=item_int,
+                user_dense_feats=user_dense,
+                item_dense_feats=item_dense,
+                seq_data=seq_data if seq_data else None,
+                seq_lens=seq_lens if seq_lens else None,
+            )
+            probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
             all_probs.extend(probs.tolist())
             all_user_ids.extend(user_ids)
 
